@@ -1,0 +1,8 @@
+﻿/target/
+privateKey.pem
+publicKey.pem
+
+# IDE
+/.idea/
+/.vscode/
+flow/
