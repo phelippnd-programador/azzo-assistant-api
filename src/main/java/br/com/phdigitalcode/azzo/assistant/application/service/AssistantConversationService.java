@@ -20,6 +20,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import br.com.phdigitalcode.azzo.assistant.classifier.OpenNLPIntentClassifier;
 import br.com.phdigitalcode.azzo.assistant.dialogue.ConversationData;
+import br.com.phdigitalcode.azzo.assistant.llm.OllamaDateEnricher;
+import br.com.phdigitalcode.azzo.assistant.llm.OllamaIntentService;
+import br.com.phdigitalcode.azzo.assistant.llm.OllamaSlotExtractor;
 import br.com.phdigitalcode.azzo.assistant.dialogue.ConversationStage;
 import br.com.phdigitalcode.azzo.assistant.dialogue.TimePeriod;
 import br.com.phdigitalcode.azzo.assistant.domain.entity.ConversationStateEntity;
@@ -45,6 +48,9 @@ public class AssistantConversationService {
   private static final Logger LOG = Logger.getLogger(AssistantConversationService.class);
 
   @Inject OpenNLPIntentClassifier intentClassifier;
+  @Inject OllamaIntentService ollamaIntentService;
+  @Inject OllamaDateEnricher ollamaDateEnricher;
+  @Inject OllamaSlotExtractor ollamaSlotExtractor;
   @Inject ServiceNameFinder serviceNameFinder;
   @Inject ProfessionalNameFinder professionalNameFinder;
   @Inject AssistantDomainService domainService;
@@ -58,6 +64,8 @@ public class AssistantConversationService {
   String greetingZone;
   @ConfigProperty(name = "assistant.intent.min-confidence", defaultValue = "0.62")
   double minIntentConfidence;
+  @ConfigProperty(name = "assistant.ollama.min-confidence", defaultValue = "0.75")
+  double ollamaMinConfidence;
 
   @Transactional
   public AssistantMessageResponse process(String rawMessage, String explicitUserIdentifier, String explicitUserName) {
@@ -94,7 +102,7 @@ public class AssistantConversationService {
     } else {
       entity.stateJson = toJson(data);
       entity.updatedAt = Instant.now();
-      stateRepository.persist(entity);
+      stateRepository.save(entity);
     }
 
     AssistantMessageResponse response = new AssistantMessageResponse();
@@ -131,27 +139,47 @@ public class AssistantConversationService {
       return correctionReply;
     }
 
+    // Enriquecimento via Ollama: tenta melhorar a classificação quando OpenNLP tem baixa confiança
+    intentPrediction = enrichIntentWithOllama(intentPrediction, rawMessage, data.stage);
+    intent = intentPrediction.intent;
+
     String disambiguationReply = handleLowConfidenceIntent(data, intentPrediction, prioritizeSlotInput);
     if (disambiguationReply != null) {
       return disambiguationReply;
     }
 
     if (data.stage == ConversationStage.CONFIRMATION) {
-      if (DateTimeRegexExtractor.isAffirmative(normalized)) {
+      // Confirmação: determinístico primeiro (sem Ollama), depois fallback Ollama
+      if (DateTimeRegexExtractor.isAffirmative(normalized) || isInformalAffirmative(normalized)) {
         domainService.confirmAppointment(tenantId, data.appointmentId, data.userIdentifier);
         if (data.sourceAppointmentId != null && !data.sourceAppointmentId.equals(data.appointmentId)) {
           domainService.cancelAppointmentForUser(tenantId, userIdentifier, data.sourceAppointmentId);
         }
         data.reset();
-        return "Agendamento confirmado com sucesso.";
+        return "Agendamento confirmado! ✅ Te esperamos lá. 😊";
       }
-      if (DateTimeRegexExtractor.isNegative(normalized)) {
+      if (DateTimeRegexExtractor.isNegative(normalized) || isInformalNegative(normalized)) {
         domainService.cancelAppointment(tenantId, data.appointmentId, data.userIdentifier);
         data.reset();
-        return "Sem problemas. Nao confirmei e limpei este atendimento. "
-            + "Quando quiser, iniciamos um novo agendamento.";
+        return "Tudo bem! Cancelei esse agendamento. Quando quiser marcar de novo, é só chamar. 👋";
       }
-      return "Para concluir, responda apenas SIM para confirmar ou NAO para ajustar os dados.";
+      // Fallback Ollama: cobre expressões ainda mais informais ("pode!", "fecha!", "não quero mais")
+      Optional<Boolean> ollamaConfirm = ollamaSlotExtractor.extractConfirmation(rawMessage);
+      if (ollamaConfirm.isPresent()) {
+        if (Boolean.TRUE.equals(ollamaConfirm.get())) {
+          domainService.confirmAppointment(tenantId, data.appointmentId, data.userIdentifier);
+          if (data.sourceAppointmentId != null && !data.sourceAppointmentId.equals(data.appointmentId)) {
+            domainService.cancelAppointmentForUser(tenantId, userIdentifier, data.sourceAppointmentId);
+          }
+          data.reset();
+          return "Agendamento confirmado! ✅ Te esperamos lá. 😊";
+        } else {
+          domainService.cancelAppointment(tenantId, data.appointmentId, data.userIdentifier);
+          data.reset();
+          return "Tudo bem! Cancelei esse agendamento. Quando quiser marcar de novo, é só chamar. 👋";
+        }
+      }
+      return "Não entendi direito. Manda *SIM* pra confirmar ou *NÃO* pra cancelar, tá? 😊";
     }
 
     if (!prioritizeSlotInput && intent == IntentType.GREETING && data.stage != ConversationStage.CONFIRMATION) {
@@ -163,13 +191,13 @@ public class AssistantConversationService {
     }
     if (!prioritizeSlotInput && intent == IntentType.CANCEL) {
       if (!domainService.canCancelViaWhatsApp(tenantId)) {
-        return "Este salao nao permite cancelamentos pelo WhatsApp no momento.";
+        return "Esse salão não permite cancelamentos pelo WhatsApp agora. 😕";
       }
       return iniciarFluxoCancelamento(data, userIdentifier, tenantId);
     }
     if (!prioritizeSlotInput && intent == IntentType.RESCHEDULE) {
       if (!domainService.canRescheduleViaWhatsApp(tenantId)) {
-        return "Este salao nao permite remarcacoes pelo WhatsApp no momento.";
+        return "Esse salão não permite remarcações pelo WhatsApp agora. 😕";
       }
       return iniciarFluxoRemarcacao(data, userIdentifier, tenantId);
     }
@@ -177,26 +205,47 @@ public class AssistantConversationService {
     if (data.stage == ConversationStage.ASK_CANCEL_APPOINTMENT) {
       if (!domainService.canCancelViaWhatsApp(tenantId)) {
         data.stage = ConversationStage.START;
-        return "Este salao nao permite cancelamentos pelo WhatsApp no momento.";
+        return "Esse salão não permite cancelamentos pelo WhatsApp agora. 😕";
       }
+
+      // Aguardando confirmação do cancelamento selecionado
+      if (data.pendingCancelAppointmentId != null) {
+        if (DateTimeRegexExtractor.isAffirmative(normalized) || isInformalAffirmative(normalized)) {
+          domainService.cancelAppointmentForUser(tenantId, userIdentifier, data.pendingCancelAppointmentId);
+          data.pendingCancelAppointmentId = null;
+          resetFlowKeepCustomer(data);
+          data.stage = ConversationStage.COMPLETED;
+          return "Prontinho! Agendamento cancelado. ✅ Se quiser marcar outro, é só falar. 😊";
+        }
+        if (DateTimeRegexExtractor.isNegative(normalized) || isInformalNegative(normalized)) {
+          data.pendingCancelAppointmentId = null;
+          resetFlowKeepCustomer(data);
+          data.stage = ConversationStage.START;
+          return "Tudo bem! Cancelamento desfeito. Precisa de mais alguma coisa? 😊";
+        }
+        return "Confirma o cancelamento? Manda *SIM* pra cancelar ou *NÃO* pra manter. 😊";
+      }
+
+      // Seleção do agendamento a cancelar
       UUID selectedAppointmentId = parseSelectedAppointmentId(data, rawMessage);
       if (selectedAppointmentId == null) {
-        return "Escolha qual agendamento cancelar pelo numero: " + buildNumberedAppointmentList(data.appointmentOptionLabels);
+        return "Qual você quer cancelar? Manda o número:\n" + buildNumberedAppointmentList(data.appointmentOptionLabels);
       }
-      domainService.cancelAppointmentForUser(tenantId, userIdentifier, selectedAppointmentId);
-      resetFlowKeepCustomer(data);
-      data.stage = ConversationStage.COMPLETED;
-      return "Pronto, agendamento cancelado com sucesso. Se quiser, posso iniciar um novo agendamento.";
+      // Pede confirmação antes de cancelar
+      int idx = data.appointmentOptionIds.indexOf(selectedAppointmentId.toString());
+      String label = idx >= 0 ? data.appointmentOptionLabels.get(idx) : "esse agendamento";
+      data.pendingCancelAppointmentId = selectedAppointmentId;
+      return "Vai cancelar:\n*" + label + "*\n\nConfirma? Manda *SIM* pra cancelar ou *NÃO* pra manter. 😊";
     }
 
     if (data.stage == ConversationStage.ASK_RESCHEDULE_APPOINTMENT) {
       if (!domainService.canRescheduleViaWhatsApp(tenantId)) {
         data.stage = ConversationStage.START;
-        return "Este salao nao permite remarcacoes pelo WhatsApp no momento.";
+        return "Esse salão não permite remarcações pelo WhatsApp agora. 😕";
       }
       UUID selectedAppointmentId = parseSelectedAppointmentId(data, rawMessage);
       if (selectedAppointmentId == null) {
-        return "Escolha qual agendamento voce quer remarcar pelo numero: "
+        return "Qual você quer remarcar? Manda o número:\n"
             + buildNumberedAppointmentList(data.appointmentOptionLabels);
       }
 
@@ -211,13 +260,13 @@ public class AssistantConversationService {
       data.serviceName = option.serviceName;
       data.professionalName = option.professionalName;
       data.stage = ConversationStage.ASK_DATE;
-      return "Perfeito. Vamos remarcar " + option.serviceName + " com " + option.professionalName
-          + ". Qual nova data voce deseja?";
+      return "Ótimo! Vamos remarcar *" + option.serviceName + "* com " + option.professionalName
+          + ". Que novo dia funciona pra você? 📅";
     }
 
     if (data.stage == ConversationStage.START || data.stage == ConversationStage.COMPLETED) {
       if (!domainService.canScheduleViaWhatsApp(tenantId)) {
-        return "Este salao nao permite novos agendamentos pelo WhatsApp no momento.";
+        return "Esse salão não permite novos agendamentos pelo WhatsApp agora. 😕";
       }
       data.stage = (data.customerName != null && !data.customerName.isBlank())
           ? ConversationStage.ASK_SERVICE
@@ -229,9 +278,13 @@ public class AssistantConversationService {
       if (maybeName != null) {
         data.customerName = maybeName;
         data.stage = ConversationStage.ASK_SERVICE;
+        // Retorna imediatamente — a mesma mensagem do nome NÃO deve ser reutilizada
+        // para resolução de serviço, evitando que o Ollama alucie um serviço a partir
+        // do nome do cliente (ex: "Carlos Silva" → "Barba").
+        return domainService.formatServicesPrompt(tenantId);
       } else {
         data.stage = ConversationStage.ASK_NAME;
-        return "Antes de agendar, preciso do seu nome. Exemplo: Phelipp Nascimento.";
+        return "Oi! Pra começar, me conta seu nome completo. 😊";
       }
     }
 
@@ -240,6 +293,15 @@ public class AssistantConversationService {
       Optional<ServicoDto> resolved = extracted.flatMap(n -> domainService.resolveService(tenantId, n));
       if (resolved.isEmpty()) {
         resolved = domainService.resolveService(tenantId, rawMessage);
+      }
+      // Fallback Ollama: identifica serviço em linguagem natural ("quero fazer as unhas")
+      if (resolved.isEmpty()) {
+        List<String> serviceNames = domainService.listServices(tenantId).stream()
+            .map(s -> s.name).toList();
+        Optional<String> ollamaService = ollamaSlotExtractor.extractServiceName(rawMessage, serviceNames);
+        if (ollamaService.isPresent()) {
+          resolved = domainService.resolveService(tenantId, ollamaService.get());
+        }
       }
       if (resolved.isPresent()) {
         ServicoDto service = resolved.get();
@@ -270,6 +332,13 @@ public class AssistantConversationService {
         if (resolved.isEmpty()) {
           resolved = domainService.resolveProfessional(tenantId, rawMessage, data.serviceId);
         }
+        // Fallback Ollama: identifica profissional em linguagem natural ("pode ser a Maria")
+        if (resolved.isEmpty() && !data.professionalOptionNames.isEmpty()) {
+          Optional<String> ollamaProf = ollamaSlotExtractor.extractProfessionalName(rawMessage, data.professionalOptionNames);
+          if (ollamaProf.isPresent()) {
+            resolved = domainService.resolveProfessional(tenantId, ollamaProf.get(), data.serviceId);
+          }
+        }
         if (resolved.isPresent()) {
           ProfissionalDto professional = resolved.get();
           data.professionalId = UUID.fromString(professional.id);
@@ -293,11 +362,18 @@ public class AssistantConversationService {
 
     if (data.date == null) {
       Optional<LocalDate> date = DateTimeRegexExtractor.extractDate(rawMessage);
+      if (date.isEmpty() && looksLikeTemporalExpression(rawMessage)) {
+        // Fallback LLM: só chama se a mensagem parece uma expressão temporal
+        // ("sexta", "semana que vem", "próximo mês", etc.).
+        // Evita alucinações quando o usuário manda texto não relacionado a datas
+        // (ex: nome de serviço, profissional, confirmações informais).
+        date = ollamaDateEnricher.enrich(rawMessage);
+      }
       if (date.isPresent()) {
         LocalDate extracted = date.get();
         if (extracted.isBefore(java.time.LocalDate.now())) {
           data.stage = ConversationStage.ASK_DATE;
-          return "Essa data ja passou. Por favor, informe uma data a partir de hoje. Exemplo: amanha ou 25/04/2026.";
+          return "Essa data já passou. Me manda uma data a partir de hoje, tá? Ex: amanhã ou 25/04. 😅";
         }
         data.date = extracted;
         data.preferredPeriod = null;
@@ -306,19 +382,31 @@ public class AssistantConversationService {
         data.stage = ConversationStage.ASK_PERIOD;
       } else {
         data.stage = ConversationStage.ASK_DATE;
-        return "Qual data voce deseja? Exemplo: 25/02/2026 ou amanha.";
+        return "Que dia você quer? Pode mandar tipo \"amanhã\", \"sexta\" ou uma data como 25/04. 📅";
       }
     }
 
     if (data.preferredPeriod == null) {
       Optional<TimePeriod> period = TimePeriod.fromText(normalized);
+      // Fallback Ollama: expressões como "de manhã cedo", "pós-almoço", "fim do dia"
+      if (period.isEmpty()) {
+        Optional<String> ollamaPeriod = ollamaSlotExtractor.extractTimePeriod(rawMessage);
+        if (ollamaPeriod.isPresent()) {
+          period = switch (ollamaPeriod.get()) {
+            case "MORNING"   -> Optional.of(TimePeriod.MORNING);
+            case "AFTERNOON" -> Optional.of(TimePeriod.AFTERNOON);
+            case "NIGHT"     -> Optional.of(TimePeriod.NIGHT);
+            default          -> Optional.empty();
+          };
+        }
+      }
       if (period.isPresent()) {
         data.preferredPeriod = period.get();
         data.availableTimeOptions.clear();
         data.stage = ConversationStage.ASK_TIME;
       } else {
         data.stage = ConversationStage.ASK_PERIOD;
-        return "Perfeito. Voce prefere manha, tarde ou noite?";
+        return "Legal! Prefere de manhã, tarde ou noite? ☀️🌙";
       }
     }
 
@@ -334,7 +422,7 @@ public class AssistantConversationService {
         data.preferredPeriod = null;
         data.availableTimeOptions.clear();
         data.stage = ConversationStage.ASK_DATE;
-        return "Sem problema. Qual novo dia voce deseja?";
+        return "Sem problema! Que novo dia funciona? 📅";
       }
 
       if (data.availableTimeOptions.isEmpty()) {
@@ -342,8 +430,8 @@ public class AssistantConversationService {
       }
       if (data.availableTimeOptions.isEmpty()) {
         data.stage = ConversationStage.ASK_TIME;
-        return "Nao encontrei horarios vagos para " + data.preferredPeriod.label()
-            + " nessa data. Voce pode escolher outro periodo (manha/tarde/noite) ou trocar o dia.";
+        return "Não tem horário vago de " + data.preferredPeriod.label()
+            + " nessa data. 😕 Quer tentar outro período (manhã/tarde/noite) ou mudar o dia?";
       }
 
       OptionalInt index = parseOrdinalSelection(rawMessage, data.availableTimeOptions.size());
@@ -357,18 +445,41 @@ public class AssistantConversationService {
             data.time = normalizedTime;
           } else {
             data.stage = ConversationStage.ASK_TIME;
-            return "Escolha apenas um horario vago de " + data.preferredPeriod.label() + ": "
+            return "Esse horário não está disponível. Escolha um dos vagos de " + data.preferredPeriod.label() + ":\n"
                 + buildNumberedTimeList(data.availableTimeOptions)
-                + " Se quiser, digite outro periodo (manha/tarde/noite) ou 'trocar dia'.";
+                + "\nOu fala outro período ou \"trocar dia\" pra mudar. 😊";
           }
         }
       }
 
       if (data.time == null) {
         data.stage = ConversationStage.ASK_TIME;
-        return "Escolha um horario vago de " + data.preferredPeriod.label() + " pelo numero ou horario: "
+        return "Qual horário de " + data.preferredPeriod.label() + " fica bom? Escolha pelo número:\n"
             + buildNumberedTimeList(data.availableTimeOptions)
-            + " Se quiser, digite outro periodo (manha/tarde/noite) ou 'trocar dia'.";
+            + "\nOu fala outro período ou \"trocar dia\". 😊";
+      }
+    }
+
+    // Validação extra: se a data é hoje, rejeita horários já passados (cache desatualizado)
+    if (data.date != null && data.date.isEqual(LocalDate.now())) {
+      try {
+        LocalTime selectedTime = LocalTime.parse(data.time);
+        if (selectedTime.isBefore(LocalTime.now(ZoneId.of(greetingZone)))) {
+          data.time = null;
+          data.availableTimeOptions.clear(); // força recarga de slots frescos
+          data.stage = ConversationStage.ASK_TIME;
+          List<String> freshSlots = new ArrayList<>(
+              domainService.suggestTimes(tenantId, data.professionalId, data.date, data.serviceId, data.preferredPeriod));
+          if (freshSlots.isEmpty()) {
+            return "Esse horário já passou e não tem mais vaga hoje. 😅 Quer tentar outro dia? Manda \"trocar dia\".";
+          }
+          data.availableTimeOptions = freshSlots;
+          return "Esse horário já passou! 😅 Escolhe um disponível ainda hoje:\n"
+              + buildNumberedTimeList(data.availableTimeOptions)
+              + "\nOu manda \"trocar dia\" pra escolher outra data.";
+        }
+      } catch (RuntimeException ignored) {
+        // Parsing de hora falhou — deixa o isSlotAvailable rejeitar
       }
     }
 
@@ -377,23 +488,23 @@ public class AssistantConversationService {
       data.stage = ConversationStage.ASK_TIME;
       data.availableTimeOptions = new ArrayList<>(domainService.suggestTimes(tenantId, data.professionalId, data.date, data.serviceId, data.preferredPeriod));
       if (data.availableTimeOptions.isEmpty()) {
-        return "Esse horario ficou indisponivel e nao ha vagas nesse periodo. "
-            + "Escolha outro periodo (manha/tarde/noite) ou troque o dia.";
+        return "Esse horário ficou indisponível e não tem mais vaga nesse período. 😕 "
+            + "Quer tentar outro período (manhã/tarde/noite) ou mudar o dia?";
       }
-      return "Esse horario ficou indisponivel. Escolha um dos horarios vagos de " + data.preferredPeriod.label()
-          + ": " + buildNumberedTimeList(data.availableTimeOptions);
+      return "Esse horário ficou indisponível. Escolha outro de " + data.preferredPeriod.label() + ":\n"
+          + buildNumberedTimeList(data.availableTimeOptions);
     }
 
     if (data.appointmentId == null) {
       if (data.sourceAppointmentId == null && !domainService.canScheduleViaWhatsApp(tenantId)) {
         resetFlowKeepCustomer(data);
         data.stage = ConversationStage.START;
-        return "Este salao nao permite novos agendamentos pelo WhatsApp no momento.";
+        return "Esse salão não permite novos agendamentos pelo WhatsApp agora. 😕";
       }
       if (data.sourceAppointmentId != null && !domainService.canRescheduleViaWhatsApp(tenantId)) {
         resetFlowKeepCustomer(data);
         data.stage = ConversationStage.START;
-        return "Este salao nao permite remarcacoes pelo WhatsApp no momento.";
+        return "Esse salão não permite remarcações pelo WhatsApp agora. 😕";
       }
       try {
         data.appointmentId = domainService.createPendingAppointment(
@@ -413,17 +524,17 @@ public class AssistantConversationService {
         data.availableTimeOptions = new ArrayList<>(domainService.suggestTimes(
             tenantId, data.professionalId, data.date, data.serviceId, data.preferredPeriod));
         if (data.availableTimeOptions.isEmpty()) {
-          return "Esse horario acabou de ser reservado e nao ha mais vagas nesse periodo. "
-              + "Escolha outro periodo (manha/tarde/noite) ou troque o dia.";
+          return "Esse horário acabou de ser reservado. 😕 Não tem mais vaga nesse período. "
+              + "Quer mudar o período (manhã/tarde/noite) ou o dia?";
         }
-        return "Esse horario acabou de ser reservado por outro cliente. Escolha um novo horario de "
-            + data.preferredPeriod.label() + ": " + buildNumberedTimeList(data.availableTimeOptions);
+        return "Esse horário acabou de ser reservado por outro cliente. Escolha um novo de "
+            + data.preferredPeriod.label() + ":\n" + buildNumberedTimeList(data.availableTimeOptions);
       }
     }
 
     data.stage = ConversationStage.CONFIRMATION;
     return String.format(Locale.ROOT,
-        "Confirma este agendamento? Servico: %s, profissional: %s, data: %s, horario: %s. Responda SIM ou NAO.",
+        "Tá quase! Confirma o agendamento?\n\n✂️ *%s*\n👤 %s\n📅 %s às %s\n\nResponde *SIM* pra confirmar ou *NÃO* pra cancelar.",
         data.serviceName,
         data.professionalName,
         data.date,
@@ -433,7 +544,7 @@ public class AssistantConversationService {
   private String handleCorrections(ConversationData data, String normalizedMessage, String tenantId) {
     if (wantsChangeDay(normalizedMessage)) {
       if (data.serviceId == null || data.professionalId == null) {
-        return "Primeiro vamos definir servico e profissional, depois posso trocar o dia.";
+        return "Primeiro me fala o serviço e o profissional, aí a gente troca o dia. 😊";
       }
       cancelPendingIfExists(data, tenantId);
       data.date = null;
@@ -441,7 +552,7 @@ public class AssistantConversationService {
       data.preferredPeriod = null;
       data.availableTimeOptions.clear();
       data.stage = ConversationStage.ASK_DATE;
-      return "Sem problema. Qual novo dia voce deseja?";
+      return "Sem problema! Que novo dia funciona? 📅";
     }
 
     if (isRestartCommand(normalizedMessage)) {
@@ -450,7 +561,7 @@ public class AssistantConversationService {
       data.reset();
       data.customerName = customerName;
       data.stage = ConversationStage.ASK_SERVICE;
-      return "Perfeito, reiniciei este atendimento. " + domainService.formatServicesPrompt(tenantId);
+      return "Tudo bem! Recomeçamos do zero. " + domainService.formatServicesPrompt(tenantId);
     }
 
     if (isChangeServiceCommand(normalizedMessage)) {
@@ -468,7 +579,7 @@ public class AssistantConversationService {
       data.professionalOptionNames.clear();
       data.availableTimeOptions.clear();
       data.stage = ConversationStage.ASK_SERVICE;
-      return "Sem problema. Qual servico voce quer agora?";
+      return "Tudo bem! Qual serviço você quer? 💅";
     }
 
     if (isChangeProfessionalCommand(normalizedMessage)) {
@@ -485,8 +596,8 @@ public class AssistantConversationService {
       data.availableTimeOptions.clear();
       data.stage = ConversationStage.ASK_PROFESSIONAL;
       return data.serviceId == null
-          ? "Primeiro me informe o servico."
-          : "Sem problema. " + buildProfessionalPrompt(data, tenantId);
+          ? "Primeiro me fala o serviço, tá?"
+          : "Tudo bem! " + buildProfessionalPrompt(data, tenantId);
     }
 
     if (isBackCommand(normalizedMessage)) {
@@ -545,7 +656,7 @@ public class AssistantConversationService {
   private String buildProfessionalPrompt(ConversationData data, String tenantId) {
     List<ProfissionalDto> options = domainService.listProfessionalsByService(tenantId, data.serviceId);
     if (options.isEmpty()) {
-      return "Nao encontrei profissionais ativos para esse servico.";
+      return "Hmm, não encontrei profissionais disponíveis pra esse serviço. 😕 Tenta outro?";
     }
 
     data.professionalOptionIds.clear();
@@ -556,16 +667,16 @@ public class AssistantConversationService {
       data.professionalOptionNames.add(options.get(i).name);
     }
 
-    return "Escolha o profissional pelo numero ou nome: " + buildNumberedProfessionalList(data.professionalOptionNames);
+    return "Com quem você quer? Escolha pelo número ou nome:\n" + buildNumberedProfessionalList(data.professionalOptionNames);
   }
 
   private String buildNumberedProfessionalList(List<String> names) {
     StringBuilder out = new StringBuilder();
     for (int i = 0; i < names.size(); i++) {
-      if (i > 0) out.append(", ");
+      if (i > 0) out.append("\n");
       out.append(i + 1).append(" - ").append(names.get(i));
     }
-    out.append(". Voce tambem pode responder 'ultimo'.");
+    out.append("\nPode mandar o número ou o nome. 😊");
     return out.toString();
   }
 
@@ -575,17 +686,17 @@ public class AssistantConversationService {
       if (i > 0) out.append("\n");
       out.append(i + 1).append(" - ").append(times.get(i));
     }
-    out.append("\nVoce tambem pode responder 'ultimo'.");
+    out.append("\nPode mandar o número ou o horário. ⏰");
     return out.toString();
   }
 
   private String buildNumberedAppointmentList(List<String> labels) {
     StringBuilder out = new StringBuilder();
     for (int i = 0; i < labels.size(); i++) {
-      if (i > 0) out.append(", ");
+      if (i > 0) out.append("\n");
       out.append(i + 1).append(" - ").append(labels.get(i));
     }
-    out.append(". Voce tambem pode responder 'ultimo'.");
+    out.append("\nManda o número do agendamento. 😊");
     return out.toString();
   }
 
@@ -614,7 +725,7 @@ public class AssistantConversationService {
   private String extractCustomerName(String rawMessage) {
     if (rawMessage == null) return null;
     String trimmed = rawMessage.trim();
-    if (trimmed.length() < 3 || trimmed.length() > 80) return null;
+    if (trimmed.length() < 2 || trimmed.length() > 80) return null;
 
     // Rejeita strings com 3 ou mais dígitos (telefones, datas, códigos)
     // mas permite nomes como "João 2º" ou "Ana 3ª"
@@ -681,12 +792,12 @@ public class AssistantConversationService {
         domainService.listUpcomingOptionsForUser(tenantId, userIdentifier, 10);
     if (options.isEmpty()) {
       data.stage = ConversationStage.START;
-      return "Voce nao possui agendamentos ativos para cancelar no momento.";
+      return "Não encontrei agendamentos ativos pra cancelar. 😊";
     }
 
     fillAppointmentOptions(data, options);
     data.stage = ConversationStage.ASK_CANCEL_APPOINTMENT;
-    return "Qual agendamento voce quer cancelar? " + buildNumberedAppointmentList(data.appointmentOptionLabels);
+    return "Qual você quer cancelar? Manda o número:\n" + buildNumberedAppointmentList(data.appointmentOptionLabels);
   }
 
   private String iniciarFluxoRemarcacao(ConversationData data, String userIdentifier, String tenantId) {
@@ -695,12 +806,12 @@ public class AssistantConversationService {
         domainService.listUpcomingOptionsForUser(tenantId, userIdentifier, 10);
     if (options.isEmpty()) {
       data.stage = ConversationStage.START;
-      return "Voce nao possui agendamentos ativos para remarcar no momento.";
+      return "Não encontrei agendamentos ativos pra remarcar. 😊";
     }
 
     fillAppointmentOptions(data, options);
     data.stage = ConversationStage.ASK_RESCHEDULE_APPOINTMENT;
-    return "Qual agendamento voce quer remarcar? " + buildNumberedAppointmentList(data.appointmentOptionLabels);
+    return "Qual você quer remarcar? Manda o número:\n" + buildNumberedAppointmentList(data.appointmentOptionLabels);
   }
 
   private void fillAppointmentOptions(ConversationData data, List<AssistantDomainService.UpcomingAppointmentOption> options) {
@@ -709,7 +820,7 @@ public class AssistantConversationService {
     for (AssistantDomainService.UpcomingAppointmentOption item : options) {
       data.appointmentOptionIds.add(item.appointmentId.toString());
       data.appointmentOptionLabels.add(
-          item.serviceName + " com " + item.professionalName + " em " + item.date + " as " + item.time);
+          item.serviceName + " com " + item.professionalName + " em " + item.date + " às " + item.time);
     }
   }
 
@@ -728,37 +839,37 @@ public class AssistantConversationService {
     if (data.stage == ConversationStage.START || data.stage == ConversationStage.COMPLETED) {
       if (data.customerName != null && !data.customerName.isBlank()) {
         data.stage = ConversationStage.ASK_SERVICE;
-        return greetingBase + " Que bom falar com voce de novo. " + domainService.formatServicesPrompt(tenantId);
+        return greetingBase + " Que bom te ver de novo! 😊 " + domainService.formatServicesPrompt(tenantId);
       }
       data.stage = ConversationStage.ASK_NAME;
-      return greetingBase + " Que bom falar com voce. Para comecar, me informe seu nome.";
+      return greetingBase + " Que bom falar com você! Pra começar, me conta seu nome. 😊";
     }
     if (data.stage == ConversationStage.ASK_NAME) {
-      return greetingBase + " Para eu continuar, me diga seu nome completo.";
+      return greetingBase + " Pra continuar, me conta seu nome completo. 😊";
     }
     if (data.stage == ConversationStage.ASK_SERVICE) {
-      return greetingBase + " Vamos agendar. " + domainService.formatServicesPrompt(tenantId);
+      return greetingBase + " Vamos lá! " + domainService.formatServicesPrompt(tenantId);
     }
     if (data.stage == ConversationStage.ASK_PROFESSIONAL) {
-      return greetingBase + " Agora me diga qual profissional voce prefere.";
+      return greetingBase + " Com quem você quer? Me fala o profissional. 😊";
     }
     if (data.stage == ConversationStage.ASK_DATE) {
-      return greetingBase + " Qual data voce deseja para o atendimento?";
+      return greetingBase + " Que dia fica bom? 📅";
     }
     if (data.stage == ConversationStage.ASK_PERIOD) {
-      return greetingBase + " Para esse dia, prefere manha, tarde ou noite?";
+      return greetingBase + " Prefere de manhã, tarde ou noite? ☀️🌙";
     }
     if (data.stage == ConversationStage.ASK_TIME) {
-      String periodLabel = data.preferredPeriod != null ? data.preferredPeriod.label() : "seu periodo escolhido";
-      return greetingBase + " Me informe o horario desejado dentre os horarios vagos de " + periodLabel + ".";
+      String periodLabel = data.preferredPeriod != null ? data.preferredPeriod.label() : "seu período";
+      return greetingBase + " Me fala o horário de " + periodLabel + " que prefere. ⏰";
     }
     if (data.stage == ConversationStage.ASK_CANCEL_APPOINTMENT) {
-      return greetingBase + " Escolha qual agendamento voce quer cancelar pelo numero.";
+      return greetingBase + " Qual você quer cancelar? Manda o número. 😊";
     }
     if (data.stage == ConversationStage.ASK_RESCHEDULE_APPOINTMENT) {
-      return greetingBase + " Escolha qual agendamento voce quer remarcar pelo numero.";
+      return greetingBase + " Qual você quer remarcar? Manda o número. 😊";
     }
-    return greetingBase + " Vamos continuar seu agendamento.";
+    return greetingBase + " Vamos continuar! Pode mandar. 😊";
   }
 
   private boolean isDeterministicGreeting(String normalized) {
@@ -816,13 +927,13 @@ public class AssistantConversationService {
     if (data.stage == ConversationStage.CONFIRMATION || data.stage == ConversationStage.ASK_TIME) {
       data.time = null;
       data.stage = ConversationStage.ASK_PERIOD;
-      return "Voltando uma etapa. Voce prefere manha, tarde ou noite?";
+      return "Voltei! Prefere de manhã, tarde ou noite? ☀️🌙";
     }
     if (data.stage == ConversationStage.ASK_PERIOD) {
       data.preferredPeriod = null;
       data.time = null;
       data.stage = ConversationStage.ASK_DATE;
-      return "Voltando uma etapa. Qual data voce deseja?";
+      return "Voltei! Que dia você quer? 📅";
     }
     if (data.stage == ConversationStage.ASK_DATE) {
       data.date = null;
@@ -832,8 +943,8 @@ public class AssistantConversationService {
       data.professionalName = null;
       data.stage = ConversationStage.ASK_PROFESSIONAL;
       return data.serviceId == null
-          ? "Voltando uma etapa. Qual servico voce quer?"
-          : "Voltando uma etapa. " + buildProfessionalPrompt(data, tenantId);
+          ? "Voltei! Qual serviço você quer?"
+          : "Voltei! " + buildProfessionalPrompt(data, tenantId);
     }
     if (data.stage == ConversationStage.ASK_PROFESSIONAL) {
       data.professionalId = null;
@@ -842,20 +953,20 @@ public class AssistantConversationService {
       data.preferredPeriod = null;
       data.time = null;
       data.stage = ConversationStage.ASK_SERVICE;
-      return "Voltando uma etapa. Qual servico voce quer agora?";
+      return "Voltei! Qual serviço você quer? 💅";
     }
     if (data.stage == ConversationStage.ASK_SERVICE) {
       data.serviceId = null;
       data.serviceName = null;
       data.stage = ConversationStage.ASK_NAME;
-      return "Voltando uma etapa. Me diga seu nome completo.";
+      return "Voltei! Me conta seu nome completo. 😊";
     }
     if (data.stage == ConversationStage.ASK_NAME) {
-      return "Voce ja esta na primeira etapa. Me diga seu nome completo para continuar.";
+      return "Você já está na primeira etapa. Me conta seu nome pra continuar. 😊";
     }
 
     data.stage = ConversationStage.ASK_SERVICE;
-    return "Vamos retomar. " + domainService.formatServicesPrompt(tenantId);
+    return "Vamos lá! " + domainService.formatServicesPrompt(tenantId);
   }
 
   private void resetFlowKeepCustomer(ConversationData data) {
@@ -902,14 +1013,140 @@ public class AssistantConversationService {
         && data.appointmentOptionLabels.isEmpty();
   }
 
+  private IntentPrediction enrichIntentWithOllama(IntentPrediction current, String rawMessage, ConversationStage stage) {
+    // GREETING é sempre rápido — não precisa do Ollama
+    if (current.intent == IntentType.GREETING) {
+      LOG.debugf("[Ollama] Pulado: saudação detectada pelo OpenNLP");
+      return current;
+    }
+    if (current.intent != IntentType.UNKNOWN && current.confidence >= minIntentConfidence) {
+      LOG.debugf("[Ollama] Pulado: OpenNLP confiante (intent=%s conf=%.2f)", current.intent, current.confidence);
+      return current;
+    }
+    // Stages onde o usuário preenche slot literal ou a etapa tem seu próprio handler —
+    // intent enrichment não agrega valor e pode atrasar a resposta (Ollama ~10-15s no CPU)
+    if (stage == ConversationStage.ASK_DATE
+        || stage == ConversationStage.ASK_PERIOD
+        || stage == ConversationStage.ASK_TIME
+        || stage == ConversationStage.ASK_NAME
+        || stage == ConversationStage.CONFIRMATION) {
+      LOG.debugf("[Ollama] Pulado: stage=%s aguarda slot literal ou tem handler próprio", stage);
+      return current;
+    }
+
+    LOG.infof("[Ollama] OpenNLP inseguro (intent=%s conf=%.2f stage=%s) → tentando Ollama", current.intent, current.confidence, stage);
+    return ollamaIntentService.classify(rawMessage, stage.name())
+        .filter(p -> p.confidence >= ollamaMinConfidence && p.intent != IntentType.UNKNOWN)
+        .orElseGet(() -> {
+          LOG.infof("[Ollama] Sem resultado útil → mantendo OpenNLP (intent=%s)", current.intent);
+          return current;
+        });
+  }
+
   private String handleLowConfidenceIntent(ConversationData data, IntentPrediction intentPrediction, boolean prioritizeSlotInput) {
     if (prioritizeSlotInput) return null;
-    if (data.stage != ConversationStage.START && data.stage != ConversationStage.COMPLETED) return null;
     if (intentPrediction.intent == IntentType.GREETING) return null;
     if (intentPrediction.intent != IntentType.UNKNOWN && intentPrediction.confidence >= minIntentConfidence) return null;
 
-    return "Quero te ajudar sem errar. O que voce deseja agora? "
-        + "1 - Agendar, 2 - Remarcar, 3 - Cancelar, 4 - Ver meus agendamentos.";
+    // Stages onde o usuário preenche slot literal: deixar a lógica de resolução tentar.
+    // Se falhar, cada stage já tem sua própria mensagem de reprompt (serviços, profissionais, etc.)
+    if (data.stage == ConversationStage.ASK_DATE
+        || data.stage == ConversationStage.ASK_PERIOD
+        || data.stage == ConversationStage.ASK_TIME
+        || data.stage == ConversationStage.ASK_NAME
+        || data.stage == ConversationStage.ASK_SERVICE
+        || data.stage == ConversationStage.ASK_PROFESSIONAL
+        || data.stage == ConversationStage.CONFIRMATION) return null;
+
+    // START / COMPLETED / cancel / reschedule stages: menu global faz sentido
+    return "Não entendi direito. O que você quer? 😊\n1 - Agendar\n2 - Remarcar\n3 - Cancelar\n4 - Ver meus agendamentos";
+  }
+
+  /**
+   * Verifica se a mensagem parece uma expressão temporal (data ou referência de dia).
+   * Usada como guarda antes de chamar o Ollama date enricher para evitar alucinações
+   * com inputs não relacionados a datas (ex: nomes de serviço, seleções ordinais, etc.).
+   *
+   * Regras:
+   *  - Rejeita seleções ordinais simples ("1", "2", "ultimo") → não são datas
+   *  - Aceita padrões numéricos de data (dois ou mais dígitos, separadores /, -)
+   *  - Aceita palavras-chave temporais PT-BR ("sexta", "semana que vem", etc.)
+   */
+  private boolean looksLikeTemporalExpression(String msg) {
+    if (msg == null || msg.isBlank()) return false;
+    String n = TextNormalizer.normalize(msg).trim();
+
+    // Rejeição explícita: seleção ordinal pura (1-20) ou "ultimo" → não é data
+    if (n.matches("^\\d{1,2}$")) return false;
+    if (n.equals("ultimo") || n.equals("ultima") || n.equals("ult")) return false;
+
+    // Padrão numérico de data: dois ou mais dígitos COM separador (10/03, 2026-03, etc.)
+    if (n.matches(".*\\d{1,2}[/\\-.]\\d.*")) return true;
+
+    // Quatro dígitos consecutivos → provavelmente ano (ex: "2026")
+    if (n.matches(".*\\d{4}.*")) return true;
+
+    // Dois ou mais dígitos SOZINHOS sem separador → pode ser dia (ex: "25")
+    if (n.matches("^\\d{2,}$")) return true;
+
+    // Palavras-chave temporais PT-BR
+    String[] temporalKeywords = {
+        "amanha", "hoje", "ontem",
+        "semana", "mes", "ano", "proxim", "ultim",
+        "segunda", "terca", "quarta", "quinta", "sexta", "sabado", "domingo",
+        "janeiro", "fevereiro", "marco", "abril", "maio", "junho",
+        "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+        "inicio", "fim", "comeco", "final", "agora", "logo"
+    };
+    for (String kw : temporalKeywords) {
+      if (n.contains(kw)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Confirmações informais comuns no WhatsApp — tratadas deterministicamente para evitar
+   * latência do Ollama (~10-15 s no CPU) em casos simples.
+   */
+  private boolean isInformalAffirmative(String normalized) {
+    if (normalized == null) return false;
+    // Prefixo "sim" cobre "sim sim", "sim pode ser", "sim quero"
+    if (normalized.startsWith("sim")) return true;
+    // Prefixo "pode" cobre "pode", "pode ser", "pode confirmar"
+    if (normalized.startsWith("pode")) return true;
+    return switch (normalized) {
+      case "fecha", "fecha ai", "fecha aí",
+           "claro", "claro que sim",
+           "ok", "okay",
+           "bora", "vamo", "vamos",
+           "perfeito",
+           "confirmado", "confirma", "confirmar",
+           "ta", "ta bom", "ta certo", "tá", "tá bom", "tá certo",
+           "isso", "isso mesmo",
+           "vai", "vai sim",
+           "combinado" -> true;
+      default -> false;
+    };
+  }
+
+  /**
+   * Negações informais comuns no WhatsApp — tratadas deterministicamente para evitar
+   * latência do Ollama (~10-15 s no CPU) em casos simples.
+   */
+  private boolean isInformalNegative(String normalized) {
+    if (normalized == null) return false;
+    // Prefixo "nao" cobre "nao quero", "nao obrigado", "nao preciso"
+    if (normalized.startsWith("nao ")) return true;
+    return switch (normalized) {
+      case "nao", "n",
+           "nope",
+           "desisto", "desistir",
+           "deixa pra la", "deixa pra lá", "deixa",
+           "cancela", "cancela ai", "cancela aí",
+           "esquece", "esquece isso",
+           "nao quero", "nao obrigado" -> true;
+      default -> false;
+    };
   }
 
   private boolean hasWord(String text, String word) {

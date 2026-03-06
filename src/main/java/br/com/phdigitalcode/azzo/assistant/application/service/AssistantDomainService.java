@@ -3,6 +3,7 @@ package br.com.phdigitalcode.azzo.assistant.application.service;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
@@ -25,9 +26,12 @@ import br.com.phdigitalcode.azzo.assistant.util.TextNormalizer;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.eclipse.microprofile.rest.client.inject.RestClient;
+import org.jboss.logging.Logger;
 
 @ApplicationScoped
 public class AssistantDomainService {
+
+  private static final Logger LOG = Logger.getLogger(AssistantDomainService.class);
 
   private static final String STATUS_CONFIRMED = "CONFIRMED";
   private static final String STATUS_CANCELLED = "CANCELLED";
@@ -64,10 +68,10 @@ public class AssistantDomainService {
   public String formatServicesPrompt(String tenantId) {
     List<ServicoDto> services = listServices(tenantId);
     if (services.isEmpty()) {
-      return "No momento nao ha servicos disponiveis para agendamento.";
+      return "Hmm, não tem serviços disponíveis agora. 😕";
     }
-    String list = services.stream().map(s -> s.name).limit(10).collect(Collectors.joining(", "));
-    return "Me diga qual servico voce quer agendar. Opcoes: " + list;
+    String list = services.stream().map(s -> s.name).limit(10).collect(Collectors.joining("\n- ", "\n- ", ""));
+    return "Qual serviço você quer? 💅" + list;
   }
 
   // ─── Profissionais ────────────────────────────────────────────────────────
@@ -110,8 +114,14 @@ public class AssistantDomainService {
           date.toString(),
           duration,
           0);
-      return slots.stream().anyMatch(s -> startTime.equals(s.startTime) && s.available);
-    } catch (RuntimeException ignored) {
+      // Normaliza ambos os lados para "HH:mm" — API pode retornar "HH:mm:ss"
+      String normalizedTarget = normalizeSlotTime(startTime);
+      return slots.stream()
+          .filter(s -> s.available)
+          .anyMatch(s -> normalizedTarget.equals(normalizeSlotTime(s.startTime)));
+    } catch (RuntimeException e) {
+      LOG.warnf("[Slots] Erro ao verificar disponibilidade: tenant=%s prof=%s data=%s horario=%s erro=%s",
+          tenantId, professionalId, date, startTime, e.getMessage());
       return false;
     }
   }
@@ -127,12 +137,26 @@ public class AssistantDomainService {
           0);
       return slots.stream()
           .filter(s -> s.available)
-          .map(s -> s.startTime)
-          .filter(t -> period == null || belongsToPeriod(t, period))
+          // Filtra por período ANTES do map — ainda temos acesso ao startTime original
+          .filter(s -> period == null || belongsToPeriod(normalizeSlotTime(s.startTime), period))
+          // Melhores horários primeiro (score desc); empate → ordem cronológica
+          .sorted(Comparator.comparingInt((TimeSlotDto s) -> s.optimizationScore).reversed()
+              .thenComparing(s -> normalizeSlotTime(s.startTime)))
+          .map(s -> normalizeSlotTime(s.startTime))   // garante formato "HH:mm" para o usuário
+          .distinct()                                  // remove duplicatas (segurança)
+          .limit(12)                                   // máximo 12 horários no WhatsApp
           .collect(Collectors.toList());
-    } catch (RuntimeException ignored) {
+    } catch (RuntimeException e) {
+      LOG.warnf("[Slots] Erro ao buscar horários disponíveis: tenant=%s prof=%s data=%s erro=%s",
+          tenantId, professionalId, date, e.getMessage());
       return List.of();
     }
+  }
+
+  /** Normaliza horário para "HH:mm", removendo segundos se presentes ("09:00:00" → "09:00"). */
+  private String normalizeSlotTime(String time) {
+    if (time == null || time.length() <= 5) return time == null ? "" : time;
+    return time.substring(0, 5);
   }
 
   private int resolveServiceDuration(String tenantId, UUID serviceId) {
@@ -148,9 +172,12 @@ public class AssistantDomainService {
     try {
       LocalTime t = LocalTime.parse(startTime.length() == 5 ? startTime : startTime.substring(0, 5));
       return switch (period) {
-        case MORNING -> !t.isAfter(LocalTime.NOON);
-        case AFTERNOON -> t.isAfter(LocalTime.NOON) && !t.isAfter(LocalTime.of(18, 0));
-        case NIGHT -> t.isAfter(LocalTime.of(18, 0));
+        // MANHÃ: estritamente antes das 12h (12:00 é tarde, não manhã)
+        case MORNING   -> t.isBefore(LocalTime.NOON);
+        // TARDE: 12:00 até 17:59 (18:00 já é noite)
+        case AFTERNOON -> !t.isBefore(LocalTime.NOON) && t.isBefore(LocalTime.of(18, 0));
+        // NOITE: 18:00 em diante
+        case NIGHT     -> !t.isBefore(LocalTime.of(18, 0));
       };
     } catch (RuntimeException ignored) {
       return true;
@@ -204,10 +231,10 @@ public class AssistantDomainService {
   public String listUpcomingForUser(String tenantId, String userIdentifier) {
     List<UpcomingAppointmentOption> options = listUpcomingOptionsForUser(tenantId, userIdentifier, 5);
     if (options.isEmpty()) {
-      return "Nao encontrei agendamentos para este contato.";
+      return "Não encontrei agendamentos pra você. 😊";
     }
 
-    StringBuilder out = new StringBuilder("Seus proximos agendamentos:\n");
+    StringBuilder out = new StringBuilder("Seus próximos agendamentos: 📋\n");
     for (UpcomingAppointmentOption option : options) {
       out.append("- ")
           .append(option.serviceName)
@@ -215,7 +242,7 @@ public class AssistantDomainService {
           .append(option.professionalName)
           .append(" em ")
           .append(option.date)
-          .append(" as ")
+          .append(" às ")
           .append(option.time)
           .append("\n");
     }

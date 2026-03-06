@@ -13,6 +13,8 @@ public class ConversationData {
   public String time;
   public UUID appointmentId;
   public UUID sourceAppointmentId;
+  /** ID do agendamento selecionado para cancelar, aguardando confirmação do usuário. */
+  public UUID pendingCancelAppointmentId;
   public String serviceName;
   public String professionalName;
   public String customerName;
@@ -32,6 +34,7 @@ public class ConversationData {
     time = null;
     appointmentId = null;
     sourceAppointmentId = null;
+    pendingCancelAppointmentId = null;
     serviceName = null;
     professionalName = null;
     customerName = null;
