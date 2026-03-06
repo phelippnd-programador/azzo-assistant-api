@@ -39,6 +39,7 @@ import br.com.phdigitalcode.azzo.assistant.util.DateTimeRegexExtractor;
 import br.com.phdigitalcode.azzo.assistant.util.TextNormalizer;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import jakarta.enterprise.inject.Instance;
 import jakarta.transaction.Transactional;
 import org.jboss.logging.Logger;
 
@@ -50,7 +51,7 @@ public class AssistantConversationService {
   @Inject OpenNLPIntentClassifier intentClassifier;
   @Inject OllamaIntentService ollamaIntentService;
   @Inject OllamaDateEnricher ollamaDateEnricher;
-  @Inject OllamaSlotExtractor ollamaSlotExtractor;
+  @Inject Instance<OllamaSlotExtractor> ollamaSlotExtractorInstance;
   @Inject ServiceNameFinder serviceNameFinder;
   @Inject ProfessionalNameFinder professionalNameFinder;
   @Inject AssistantDomainService domainService;
@@ -164,7 +165,8 @@ public class AssistantConversationService {
         return "Tudo bem! Cancelei esse agendamento. Quando quiser marcar de novo, é só chamar. 👋";
       }
       // Fallback Ollama: cobre expressões ainda mais informais ("pode!", "fecha!", "não quero mais")
-      Optional<Boolean> ollamaConfirm = ollamaSlotExtractor.extractConfirmation(rawMessage);
+      Optional<Boolean> ollamaConfirm = ollamaSlotExtractor()
+          .flatMap(extractor -> extractor.extractConfirmation(rawMessage));
       if (ollamaConfirm.isPresent()) {
         if (Boolean.TRUE.equals(ollamaConfirm.get())) {
           domainService.confirmAppointment(tenantId, data.appointmentId, data.userIdentifier);
@@ -298,7 +300,8 @@ public class AssistantConversationService {
       if (resolved.isEmpty()) {
         List<String> serviceNames = domainService.listServices(tenantId).stream()
             .map(s -> s.name).toList();
-        Optional<String> ollamaService = ollamaSlotExtractor.extractServiceName(rawMessage, serviceNames);
+        Optional<String> ollamaService = ollamaSlotExtractor()
+            .flatMap(extractor -> extractor.extractServiceName(rawMessage, serviceNames));
         if (ollamaService.isPresent()) {
           resolved = domainService.resolveService(tenantId, ollamaService.get());
         }
@@ -334,7 +337,8 @@ public class AssistantConversationService {
         }
         // Fallback Ollama: identifica profissional em linguagem natural ("pode ser a Maria")
         if (resolved.isEmpty() && !data.professionalOptionNames.isEmpty()) {
-          Optional<String> ollamaProf = ollamaSlotExtractor.extractProfessionalName(rawMessage, data.professionalOptionNames);
+          Optional<String> ollamaProf = ollamaSlotExtractor()
+              .flatMap(extractor -> extractor.extractProfessionalName(rawMessage, data.professionalOptionNames));
           if (ollamaProf.isPresent()) {
             resolved = domainService.resolveProfessional(tenantId, ollamaProf.get(), data.serviceId);
           }
@@ -390,7 +394,8 @@ public class AssistantConversationService {
       Optional<TimePeriod> period = TimePeriod.fromText(normalized);
       // Fallback Ollama: expressões como "de manhã cedo", "pós-almoço", "fim do dia"
       if (period.isEmpty()) {
-        Optional<String> ollamaPeriod = ollamaSlotExtractor.extractTimePeriod(rawMessage);
+        Optional<String> ollamaPeriod = ollamaSlotExtractor()
+            .flatMap(extractor -> extractor.extractTimePeriod(rawMessage));
         if (ollamaPeriod.isPresent()) {
           period = switch (ollamaPeriod.get()) {
             case "MORNING"   -> Optional.of(TimePeriod.MORNING);
@@ -1156,5 +1161,16 @@ public class AssistantConversationService {
       if (word.equals(part)) return true;
     }
     return false;
+  }
+
+  private Optional<OllamaSlotExtractor> ollamaSlotExtractor() {
+    try {
+      if (ollamaSlotExtractorInstance != null && ollamaSlotExtractorInstance.isResolvable()) {
+        return Optional.of(ollamaSlotExtractorInstance.get());
+      }
+    } catch (Exception ignored) {
+      // fallback para extratores deterministicos quando bean Ollama nao estiver disponivel.
+    }
+    return Optional.empty();
   }
 }

@@ -5,4 +5,7 @@ publicKey.pem
 # IDE
 /.idea/
 /.vscode/
+.classpath
+.project
+.settings/
 flow/
