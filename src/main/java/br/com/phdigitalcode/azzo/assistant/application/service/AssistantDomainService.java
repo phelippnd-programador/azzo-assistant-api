@@ -97,10 +97,34 @@ public class AssistantDomainService {
 
     return listProfessionalsByService(tenantId, serviceId).stream()
         .sorted((left, right) -> Integer.compare(
-            scoreMatch(TextNormalizer.normalize(right.name), normalized),
-            scoreMatch(TextNormalizer.normalize(left.name), normalized)))
-        .filter(p -> scoreMatch(TextNormalizer.normalize(p.name), normalized) > 0)
+            scoreMatchProfessional(right, normalized),
+            scoreMatchProfessional(left, normalized)))
+        .filter(p -> scoreMatchProfessional(p, normalized) > 0)
         .findFirst();
+  }
+
+  /**
+   * Pontua o match de um profissional contra o texto candidato.
+   * Considera tanto o nome do profissional quanto o nome das suas especialidades,
+   * retornando o maior score entre eles.
+   */
+  private int scoreMatchProfessional(ProfissionalDto p, String normalized) {
+    int nameScore = scoreMatch(TextNormalizer.normalize(p.name), normalized);
+    if (p.specialtiesDetailed == null || p.specialtiesDetailed.isEmpty()) return nameScore;
+    int specialtyScore = p.specialtiesDetailed.stream()
+        .mapToInt(s -> scoreMatch(TextNormalizer.normalize(s.name), normalized))
+        .max()
+        .orElse(0);
+    return Math.max(nameScore, specialtyScore);
+  }
+
+  /**
+   * Retorna o nome da primeira especialidade do profissional, ou {@code null} se não houver.
+   * Usado para enriquecer a mensagem de confirmação de agendamento.
+   */
+  public String firstSpecialtyName(ProfissionalDto p) {
+    if (p == null || p.specialtiesDetailed == null || p.specialtiesDetailed.isEmpty()) return null;
+    return p.specialtiesDetailed.get(0).name;
   }
 
   // ─── Slots disponíveis ────────────────────────────────────────────────────

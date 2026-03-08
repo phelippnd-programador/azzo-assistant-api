@@ -326,6 +326,9 @@ public class AssistantConversationService {
           int selected = index.getAsInt();
           data.professionalId = UUID.fromString(data.professionalOptionIds.get(selected));
           data.professionalName = data.professionalOptionNames.get(selected);
+          if (selected < data.professionalOptionSpecialtyNames.size()) {
+            data.professionalSpecialtyName = data.professionalOptionSpecialtyNames.get(selected);
+          }
         }
       }
 
@@ -347,6 +350,7 @@ public class AssistantConversationService {
           ProfissionalDto professional = resolved.get();
           data.professionalId = UUID.fromString(professional.id);
           data.professionalName = professional.name;
+          data.professionalSpecialtyName = domainService.firstSpecialtyName(professional);
         }
       }
 
@@ -538,10 +542,13 @@ public class AssistantConversationService {
     }
 
     data.stage = ConversationStage.CONFIRMATION;
+    String profDisplay = data.professionalSpecialtyName != null
+        ? data.professionalName + " (" + data.professionalSpecialtyName + ")"
+        : data.professionalName;
     return String.format(Locale.ROOT,
         "Tá quase! Confirma o agendamento?\n\n✂️ *%s*\n👤 %s\n📅 %s às %s\n\nResponde *SIM* pra confirmar ou *NÃO* pra cancelar.",
         data.serviceName,
-        data.professionalName,
+        profDisplay,
         data.date,
         data.time);
   }
@@ -666,20 +673,36 @@ public class AssistantConversationService {
 
     data.professionalOptionIds.clear();
     data.professionalOptionNames.clear();
+    data.professionalOptionSpecialtyNames.clear();
     int limit = Math.min(options.size(), 10);
     for (int i = 0; i < limit; i++) {
-      data.professionalOptionIds.add(options.get(i).id);
-      data.professionalOptionNames.add(options.get(i).name);
+      ProfissionalDto p = options.get(i);
+      data.professionalOptionIds.add(p.id);
+      data.professionalOptionNames.add(p.name);
+      String specName = domainService.firstSpecialtyName(p);
+      data.professionalOptionSpecialtyNames.add(specName != null ? specName : "");
     }
 
-    return "Com quem você quer? Escolha pelo número ou nome:\n" + buildNumberedProfessionalList(data.professionalOptionNames);
+    return "Com quem você quer? Escolha pelo número ou nome:\n" + buildNumberedProfessionalList(options, limit);
   }
 
-  private String buildNumberedProfessionalList(List<String> names) {
+  private String buildNumberedProfessionalList(List<ProfissionalDto> options, int limit) {
     StringBuilder out = new StringBuilder();
-    for (int i = 0; i < names.size(); i++) {
+    for (int i = 0; i < limit; i++) {
       if (i > 0) out.append("\n");
-      out.append(i + 1).append(" - ").append(names.get(i));
+      ProfissionalDto p = options.get(i);
+      String specName = domainService.firstSpecialtyName(p);
+      String specDesc = (p.specialtiesDetailed != null && !p.specialtiesDetailed.isEmpty()
+          && p.specialtiesDetailed.get(0).description != null
+          && !p.specialtiesDetailed.get(0).description.isBlank())
+          ? p.specialtiesDetailed.get(0).description : null;
+      out.append(i + 1).append(" - ").append(p.name);
+      if (specName != null) {
+        out.append(" (").append(specName).append(")");
+        if (specDesc != null) {
+          out.append("\n   ").append(specDesc);
+        }
+      }
     }
     out.append("\nPode mandar o número ou o nome. 😊");
     return out.toString();
