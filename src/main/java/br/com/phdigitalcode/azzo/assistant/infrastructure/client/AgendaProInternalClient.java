@@ -56,6 +56,7 @@ public interface AgendaProInternalClient {
       @QueryParam("tenantId") String tenantId,
       @QueryParam("professionalId") String professionalId,
       @QueryParam("date") String date,
+      @QueryParam("serviceIds") String serviceIds,
       @QueryParam("duration") int duration,
       @QueryParam("buffer") int buffer);
 

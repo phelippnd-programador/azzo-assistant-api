@@ -136,6 +136,7 @@ public class AssistantDomainService {
           tenantId,
           professionalId.toString(),
           date.toString(),
+          serviceId != null ? serviceId.toString() : null,
           duration,
           0);
       // Normaliza ambos os lados para "HH:mm" — API pode retornar "HH:mm:ss"
@@ -157,6 +158,7 @@ public class AssistantDomainService {
           tenantId,
           professionalId.toString(),
           date.toString(),
+          serviceId != null ? serviceId.toString() : null,
           duration,
           0);
       return slots.stream()
@@ -222,13 +224,18 @@ public class AssistantDomainService {
     ClienteDto client = resolveOrCreateClient(tenantId, userIdentifier, customerName);
 
     AgendamentoCreateDto req = new AgendamentoCreateDto();
-    req.serviceId = serviceId.toString();
     req.professionalId = professionalId.toString();
     req.clientId = client.id;
     req.date = date.toString();
     req.startTime = time;
     req.status = STATUS_PENDING;
     req.notes = "Criado pelo assistant";
+    AgendamentoCreateDto.ItemDto item = new AgendamentoCreateDto.ItemDto();
+    item.serviceId = serviceId.toString();
+    item.quantity = 1;
+    item.unitPrice = 0;
+    item.totalPrice = 0;
+    req.items.add(item);
 
     AgendamentoDto created = agendaProClient.criarAgendamento(tenantId, req);
     return UUID.fromString(created.id);
