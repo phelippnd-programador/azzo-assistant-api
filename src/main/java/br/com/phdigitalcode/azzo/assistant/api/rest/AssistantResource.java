@@ -9,6 +9,7 @@ import java.util.stream.Collectors;
 import br.com.phdigitalcode.azzo.assistant.application.service.AssistantConversationService;
 import br.com.phdigitalcode.azzo.assistant.domain.entity.LlmUsageDailyEntity;
 import br.com.phdigitalcode.azzo.assistant.domain.repository.LlmUsageRepository;
+import br.com.phdigitalcode.azzo.assistant.llm.AgentSystemPromptBuilder;
 import br.com.phdigitalcode.azzo.assistant.llm.LlmRouter;
 import br.com.phdigitalcode.azzo.assistant.model.AssistantMessageRequest;
 import br.com.phdigitalcode.azzo.assistant.model.AssistantMessageResponse;
@@ -16,6 +17,7 @@ import br.com.phdigitalcode.azzo.assistant.training.OpenNLPModelTrainer;
 import jakarta.inject.Inject;
 import jakarta.validation.Valid;
 import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.GET;
 import jakarta.ws.rs.HeaderParam;
 import jakarta.ws.rs.POST;
@@ -33,6 +35,7 @@ public class AssistantResource {
   @Inject OpenNLPModelTrainer          modelTrainer;
   @Inject LlmRouter                    llmRouter;
   @Inject LlmUsageRepository           usageRepository;
+  @Inject AgentSystemPromptBuilder     agentSystemPromptBuilder;
 
   /**
    * Processa uma mensagem do usuário via WhatsApp.
@@ -49,6 +52,21 @@ public class AssistantResource {
       @HeaderParam("X-User-Identifier") String userIdentifier,
       @HeaderParam("X-User-Name") String userName) {
     return conversationService.process(request.message, userIdentifier, userName);
+  }
+
+  /**
+   * Invalida o cache do system prompt para um tenant específico.
+   * Deve ser chamado após alterações de horários, serviços ou profissionais
+   * para que o LLM receba os dados atualizados imediatamente.
+   */
+  @DELETE
+  @Path("/admin/cache")
+  public Map<String, Object> invalidateCache(@QueryParam("tenantId") String tenantId) {
+    if (tenantId == null || tenantId.isBlank()) {
+      return Map.of("status", "ERROR", "message", "tenantId é obrigatório");
+    }
+    agentSystemPromptBuilder.invalidate(tenantId);
+    return Map.of("status", "OK", "tenantId", tenantId, "message", "Cache do prompt invalidado com sucesso.");
   }
 
   /**

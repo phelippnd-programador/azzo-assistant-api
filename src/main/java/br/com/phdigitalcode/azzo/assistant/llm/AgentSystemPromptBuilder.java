@@ -36,7 +36,7 @@ import org.jboss.logging.Logger;
 public class AgentSystemPromptBuilder {
 
     private static final Logger LOG = Logger.getLogger(AgentSystemPromptBuilder.class);
-    private static final long CACHE_TTL_MS = 10 * 60 * 1000L; // 10 minutos
+    private static final long CACHE_TTL_MS = 3 * 60 * 1000L; // 3 minutos (fallback de segurança)
 
     @Inject
     @RestClient
