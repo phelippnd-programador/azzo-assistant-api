@@ -27,6 +27,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
+import br.com.phdigitalcode.azzo.assistant.llm.OllamaResponseService;
 
 @ApplicationScoped
 public class AssistantDomainService {
@@ -43,6 +44,9 @@ public class AssistantDomainService {
   @Inject
   @RestClient
   AgendaProInternalClient agendaProClient;
+
+  @Inject
+  OllamaResponseService ollamaResponseService;
 
   // ─── Serviços ─────────────────────────────────────────────────────────────
 
@@ -66,12 +70,39 @@ public class AssistantDomainService {
   }
 
   public String formatServicesPrompt(String tenantId) {
+    return formatServicesPromptForCustomer(tenantId, null);
+  }
+
+  public String formatServicesPromptForCustomer(String tenantId, String customerName) {
     List<ServicoDto> services = listServices(tenantId);
     if (services.isEmpty()) {
       return "Hmm, não tem serviços disponíveis agora. 😕";
     }
-    String list = services.stream().map(s -> s.name).limit(10).collect(Collectors.joining("\n- ", "\n- ", ""));
-    return "Qual serviço você quer? 💅" + list;
+    // Tenta gerar resposta humanizada via LLM
+    Optional<String> llmReply = ollamaResponseService.generateServicesMessage(customerName, services);
+    if (llmReply.isPresent()) {
+      return llmReply.get();
+    }
+    // Fallback enriquecido: mostra preço, duração e descrição quando disponíveis
+    StringBuilder sb = new StringBuilder("Qual serviço você quer? 💅\n");
+    int idx = 1;
+    for (ServicoDto s : services.stream().limit(10).toList()) {
+      sb.append("\n").append(idx++).append(" - ").append(s.name);
+      if (s.price > 0) sb.append(" — R$").append(String.format(Locale.ROOT, "%.0f", s.price));
+      if (s.duration > 0) sb.append(" | ").append(formatDurationMinutes(s.duration));
+      if (s.description != null && !s.description.isBlank()) {
+        sb.append("\n   ").append(s.description.trim());
+      }
+    }
+    sb.append("\n\nManda o número ou o nome do serviço! 😊");
+    return sb.toString();
+  }
+
+  private String formatDurationMinutes(int minutes) {
+    if (minutes < 60) return minutes + "min";
+    int h = minutes / 60;
+    int m = minutes % 60;
+    return m == 0 ? h + "h" : h + "h" + m + "min";
   }
 
   // ─── Profissionais ────────────────────────────────────────────────────────

@@ -1,10 +1,14 @@
 package br.com.phdigitalcode.azzo.assistant.application.service;
 
+import java.time.DayOfWeek;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
+import java.time.temporal.TemporalAdjusters;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -19,9 +23,13 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import br.com.phdigitalcode.azzo.assistant.classifier.OpenNLPIntentClassifier;
+import br.com.phdigitalcode.azzo.assistant.dialogue.ChatMessage;
 import br.com.phdigitalcode.azzo.assistant.dialogue.ConversationData;
+import br.com.phdigitalcode.azzo.assistant.llm.AgentSystemPromptBuilder;
+import br.com.phdigitalcode.azzo.assistant.llm.LlmBookingAgent;
 import br.com.phdigitalcode.azzo.assistant.llm.OllamaDateEnricher;
 import br.com.phdigitalcode.azzo.assistant.llm.OllamaIntentService;
+import br.com.phdigitalcode.azzo.assistant.llm.OllamaResponseService;
 import br.com.phdigitalcode.azzo.assistant.llm.OllamaSlotExtractor;
 import br.com.phdigitalcode.azzo.assistant.dialogue.ConversationStage;
 import br.com.phdigitalcode.azzo.assistant.dialogue.TimePeriod;
@@ -51,13 +59,17 @@ public class AssistantConversationService {
   @Inject OpenNLPIntentClassifier intentClassifier;
   @Inject OllamaIntentService ollamaIntentService;
   @Inject OllamaDateEnricher ollamaDateEnricher;
+  @Inject OllamaResponseService ollamaResponseService;
   @Inject Instance<OllamaSlotExtractor> ollamaSlotExtractorInstance;
   @Inject ServiceNameFinder serviceNameFinder;
   @Inject ProfessionalNameFinder professionalNameFinder;
   @Inject AssistantDomainService domainService;
   @Inject ConversationStateRepository stateRepository;
+  @Inject ConversationStateManager stateManager;
   @Inject ContextoTenant contextoTenant;
   @Inject ObjectMapper objectMapper;
+  @Inject AgentSystemPromptBuilder agentSystemPromptBuilder;
+  @Inject LlmBookingAgent llmBookingAgent;
 
   @ConfigProperty(name = "assistant.conversation.ttl-minutes", defaultValue = "120")
   long ttlMinutes;
@@ -67,8 +79,11 @@ public class AssistantConversationService {
   double minIntentConfidence;
   @ConfigProperty(name = "assistant.ollama.min-confidence", defaultValue = "0.75")
   double ollamaMinConfidence;
+  @ConfigProperty(name = "assistant.agent.enabled", defaultValue = "false")
+  boolean agentEnabled;
 
-  @Transactional
+  // Sem @Transactional aqui — chamadas ao LLM (lentas) não podem segurar uma transação JTA aberta.
+  // As operações de DB são delegadas ao ConversationStateManager que abre transações curtas.
   public AssistantMessageResponse process(String rawMessage, String explicitUserIdentifier, String explicitUserName) {
     if (rawMessage == null || rawMessage.isBlank()) {
       throw new IllegalArgumentException("message obrigatoria");
@@ -82,28 +97,27 @@ public class AssistantConversationService {
       userName = domainService.resolveRegisteredCustomerName(tenantIdStr, userIdentifier).orElse(null);
     }
 
+    // TX 1: carrega estado (< 50ms)
     Instant threshold = Instant.now().minus(Duration.ofMinutes(ttlMinutes));
-    stateRepository.deleteExpired(threshold);
-    ConversationStateEntity entity = stateRepository
-        .findActive(tenantId, userIdentifier, threshold)
-        .orElseGet(() -> createState(tenantId, userIdentifier));
+    ConversationStateEntity entity = stateManager.loadOrCreate(tenantId, userIdentifier, threshold);
 
-    ConversationData data = parseState(entity.stateJson);
+    ConversationData data = stateManager.parseState(entity.stateJson);
     // Mantém userIdentifier sempre atualizado no estado (usado nas notificações)
     data.userIdentifier = userIdentifier;
     if ((data.customerName == null || data.customerName.isBlank()) && userName != null) {
       data.customerName = userName;
     }
 
-    String reply = handleMessage(data, rawMessage, userIdentifier, tenantIdStr);
+    // Sem TX aberta aqui: o LLM pode demorar 30-120s sem risco de timeout JTA
+    String reply = agentEnabled
+        ? handleMessageAgent(data, rawMessage, userIdentifier, tenantIdStr)
+        : handleMessage(data, rawMessage, userIdentifier, tenantIdStr);
+
+    // TX 2: persiste resultado (< 50ms)
     if (shouldDeleteConversationState(data)) {
-      if (entity.isPersistent()) {
-        stateRepository.delete(entity);
-      }
+      stateManager.delete(entity);
     } else {
-      entity.stateJson = toJson(data);
-      entity.updatedAt = Instant.now();
-      stateRepository.save(entity);
+      stateManager.save(entity, stateManager.toJson(data));
     }
 
     AssistantMessageResponse response = new AssistantMessageResponse();
@@ -125,6 +139,209 @@ public class AssistantConversationService {
     response.slots.put("sourceAppointmentId", data.sourceAppointmentId);
     return response;
   }
+
+  // ─── NOVO: LLM como agente principal ────────────────────────────────────────
+
+  /**
+   * Novo fluxo orientado a LLM: o modelo conduz toda a conversa com contexto
+   * completo do salão. Java executa as ações detectadas nos action tokens.
+   */
+  private String handleMessageAgent(ConversationData data, String rawMessage,
+      String userIdentifier, String tenantId) {
+
+    // Conversa anterior finalizada → limpa slots para nova sessão, mas mantém nome do cliente
+    if (data.stage == ConversationStage.COMPLETED) {
+      LOG.debugf("[Agent] Stage=COMPLETED — resetando slots para nova conversa");
+      String savedName = data.customerName;
+      data.reset();
+      data.customerName = savedName; // mantém o nome para não precisar perguntar de novo
+    }
+
+    // Limita o histórico a 30 mensagens para não estourar o contexto do LLM
+    if (data.chatHistory.size() > 30) {
+      List<ChatMessage> kept = new ArrayList<>(data.chatHistory.subList(
+          Math.max(0, data.chatHistory.size() - 25), data.chatHistory.size()));
+      data.chatHistory.clear();
+      data.chatHistory.addAll(kept);
+    }
+
+    // Resolve datas relativas em Java antes de enviar ao LLM (modelos 8B erram esse cálculo)
+    String enrichedMessage = enrichDatesInMessage(rawMessage);
+
+    String systemPrompt = agentSystemPromptBuilder.build(tenantId);
+    // Passa activeProvider para sticky routing — null = nova conversa, router decide
+    LlmBookingAgent.AgentResult result = llmBookingAgent.chat(
+        systemPrompt, data.chatHistory, enrichedMessage, data.activeProvider);
+
+    // Persiste o provider escolhido para manter sticky durante toda a conversa
+    if (result.providerUsed() != null) {
+      data.activeProvider = result.providerUsed();
+    }
+
+    // Processa ações — max 1 round-trip para evitar loops
+    String finalReply = processActions(result, data, userIdentifier, tenantId, systemPrompt);
+
+    // Grava no histórico para próximos turnos (usa mensagem enriquecida para consistência)
+    data.chatHistory.add(new ChatMessage("user", enrichedMessage));
+    data.chatHistory.add(new ChatMessage("assistant", finalReply));
+
+    return finalReply;
+  }
+
+  /**
+   * Executa as ações detectadas no resultado do LLM e, se necessário,
+   * re-chama o LLM com o resultado injetado no contexto.
+   */
+  private String processActions(LlmBookingAgent.AgentResult result, ConversationData data,
+      String userIdentifier, String tenantId, String systemPrompt) {
+
+    if (result.actions().isEmpty()) {
+      return result.text();
+    }
+
+    // CONSULTAR_HORARIOS — busca horários e re-chama LLM com o resultado
+    LlmBookingAgent.AgentAction slotsAction = result.firstAction("CONSULTAR_HORARIOS");
+    if (slotsAction != null) {
+      String toolResult = executeConsultarHorarios(slotsAction, data, tenantId);
+      // Injeta o resultado como contexto e pede ao LLM para apresentar ao cliente
+      String toolContext = "[Sistema] Horários disponíveis:\n" + toolResult
+          + "\nApresente esses horários ao cliente e peça para escolher pelo número ou digitando o horário.";
+      List<ChatMessage> tempHistory = new ArrayList<>(data.chatHistory);
+      tempHistory.add(new ChatMessage("assistant", result.text()));
+      LlmBookingAgent.AgentResult followUp = llmBookingAgent.chat(
+          systemPrompt, tempHistory, toolContext, data.activeProvider);
+      return followUp.text().isBlank() ? result.text() : followUp.text();
+    }
+
+    // CRIAR_AGENDAMENTO — cria o agendamento e re-chama LLM com confirmação
+    LlmBookingAgent.AgentAction bookAction = result.firstAction("CRIAR_AGENDAMENTO");
+    if (bookAction != null) {
+      String toolResult = executeCriarAgendamento(bookAction, data, userIdentifier, tenantId);
+      List<ChatMessage> tempHistory = new ArrayList<>(data.chatHistory);
+      tempHistory.add(new ChatMessage("assistant", result.text()));
+      tempHistory.add(new ChatMessage("user", "[Sistema] " + toolResult
+          + "\nConfirme o agendamento ao cliente com um resumo amigável."));
+      LlmBookingAgent.AgentResult followUp = llmBookingAgent.chat(
+          systemPrompt, tempHistory, "", data.activeProvider);
+      return followUp.text().isBlank() ? toolResult : followUp.text();
+    }
+
+    // CANCELAR_AGENDAMENTO
+    LlmBookingAgent.AgentAction cancelAction = result.firstAction("CANCELAR_AGENDAMENTO");
+    if (cancelAction != null) {
+      return executeCancelarAgendamento(cancelAction, data, userIdentifier, tenantId);
+    }
+
+    return result.text();
+  }
+
+  private String executeConsultarHorarios(LlmBookingAgent.AgentAction action,
+      ConversationData data, String tenantId) {
+    try {
+      String profAlias = action.param("prof");
+      String svcAlias = action.param("svc");
+      String dateStr = action.param("date");
+
+      UUID professionalId = profAlias != null
+          ? agentSystemPromptBuilder.resolveProfessionalId(tenantId, profAlias).orElse(null)
+          : data.professionalId;
+      UUID serviceId = svcAlias != null
+          ? agentSystemPromptBuilder.resolveServiceId(tenantId, svcAlias).orElse(null)
+          : data.serviceId;
+      LocalDate date = dateStr != null ? LocalDate.parse(dateStr) : data.date;
+
+      if (professionalId == null || date == null) {
+        return "Não consegui identificar o profissional ou a data. Tente novamente.";
+      }
+
+      // Guarda nos slots para uso posterior
+      if (professionalId != null) data.professionalId = professionalId;
+      if (serviceId != null) data.serviceId = serviceId;
+      if (date != null) data.date = date;
+
+      List<String> slots = domainService.suggestTimes(tenantId, professionalId, date, serviceId, null);
+      if (slots.isEmpty()) {
+        return "Sem horários disponíveis nessa data.";
+      }
+      data.availableTimeOptions = new ArrayList<>(slots);
+      StringBuilder sb = new StringBuilder();
+      for (int i = 0; i < slots.size(); i++) {
+        sb.append(i + 1).append(". ").append(slots.get(i)).append("\n");
+      }
+      return sb.toString().trim();
+    } catch (Exception e) {
+      LOG.warnf("[Agent] Erro ao consultar horários: %s", e.getMessage());
+      return "Erro ao consultar horários. Tente outra data.";
+    }
+  }
+
+  private String executeCriarAgendamento(LlmBookingAgent.AgentAction action,
+      ConversationData data, String userIdentifier, String tenantId) {
+    try {
+      String profAlias = action.param("prof");
+      String svcAlias = action.param("svc");
+      String dateStr = action.param("date");
+      String time = action.param("time");
+      String customerName = action.param("customer");
+
+      UUID professionalId = profAlias != null
+          ? agentSystemPromptBuilder.resolveProfessionalId(tenantId, profAlias).orElse(data.professionalId)
+          : data.professionalId;
+      UUID serviceId = svcAlias != null
+          ? agentSystemPromptBuilder.resolveServiceId(tenantId, svcAlias).orElse(data.serviceId)
+          : data.serviceId;
+      LocalDate date = dateStr != null ? LocalDate.parse(dateStr) : data.date;
+
+      if (customerName != null && !customerName.isBlank()) data.customerName = customerName.trim();
+      if (professionalId != null) data.professionalId = professionalId;
+      if (serviceId != null) data.serviceId = serviceId;
+      if (date != null) data.date = date;
+      if (time != null && !time.isBlank()) data.time = time;
+
+      if (data.serviceId == null || data.professionalId == null || data.date == null || data.time == null) {
+        return "Faltam informações para criar o agendamento (serviço, profissional, data ou horário).";
+      }
+
+      // Validação hard: nunca criar agendamento retroativo
+      if (data.date.isBefore(LocalDate.now())) {
+        LOG.warnf("[Agent] Tentativa de agendamento retroativo bloqueada: date=%s", data.date);
+        data.date = null;
+        return "[Sistema] Data inválida — essa data já passou. Informe ao cliente e peça uma data a partir de hoje.";
+      }
+
+      UUID appointmentId = domainService.createPendingAppointment(
+          tenantId, data.serviceId, data.professionalId, data.date, data.time,
+          userIdentifier, data.customerName);
+      domainService.confirmAppointment(tenantId, appointmentId, userIdentifier);
+      data.appointmentId = appointmentId;
+      data.stage = ConversationStage.COMPLETED;
+
+      return String.format("Agendamento criado com sucesso! ID: %s | Data: %s às %s",
+          appointmentId, data.date, data.time);
+    } catch (Exception e) {
+      LOG.warnf("[Agent] Erro ao criar agendamento: %s", e.getMessage());
+      return "Não consegui criar o agendamento. Verifique se o horário ainda está disponível.";
+    }
+  }
+
+  private String executeCancelarAgendamento(LlmBookingAgent.AgentAction action,
+      ConversationData data, String userIdentifier, String tenantId) {
+    try {
+      String appointmentIdStr = action.param("appointment_id");
+      if (appointmentIdStr == null || appointmentIdStr.isBlank()) {
+        return "Informe o ID do agendamento para cancelar.";
+      }
+      UUID appointmentId = UUID.fromString(appointmentIdStr);
+      domainService.cancelAppointmentForUser(tenantId, userIdentifier, appointmentId);
+      data.stage = ConversationStage.COMPLETED;
+      return "Agendamento cancelado com sucesso! Se quiser marcar outro, é só falar. 😊";
+    } catch (Exception e) {
+      LOG.warnf("[Agent] Erro ao cancelar agendamento: %s", e.getMessage());
+      return "Não consegui cancelar o agendamento. 😕";
+    }
+  }
+
+  // ─── LEGADO: máquina de estados Java ─────────────────────────────────────────
 
   private String handleMessage(ConversationData data, String rawMessage, String userIdentifier, String tenantId) {
     String normalized = TextNormalizer.normalize(rawMessage);
@@ -202,6 +419,12 @@ public class AssistantConversationService {
         return "Esse salão não permite remarcações pelo WhatsApp agora. 😕";
       }
       return iniciarFluxoRemarcacao(data, userIdentifier, tenantId);
+    }
+
+    // Pergunta de preço/valor: responde com a lista de serviços incluindo preços
+    if (!prioritizeSlotInput && isPriceQuery(normalized)
+        && data.stage != ConversationStage.CONFIRMATION) {
+      return domainService.formatServicesPromptForCustomer(tenantId, data.customerName);
     }
 
     if (data.stage == ConversationStage.ASK_CANCEL_APPOINTMENT) {
@@ -310,12 +533,14 @@ public class AssistantConversationService {
         ServicoDto service = resolved.get();
         data.serviceId = UUID.fromString(service.id);
         data.serviceName = service.name;
+        data.stageAttempts = 0;
         data.professionalOptionIds.clear();
         data.professionalOptionNames.clear();
         data.stage = ConversationStage.ASK_PROFESSIONAL;
       } else {
         data.stage = ConversationStage.ASK_SERVICE;
-        return domainService.formatServicesPrompt(tenantId);
+        data.stageAttempts++;
+        return withHandoffIfNeeded(data, domainService.formatServicesPromptForCustomer(tenantId, data.customerName));
       }
     }
 
@@ -351,12 +576,16 @@ public class AssistantConversationService {
           data.professionalId = UUID.fromString(professional.id);
           data.professionalName = professional.name;
           data.professionalSpecialtyName = domainService.firstSpecialtyName(professional);
+          data.stageAttempts = 0;
         }
       }
 
       if (data.professionalId == null) {
         data.stage = ConversationStage.ASK_PROFESSIONAL;
-        return buildProfessionalPrompt(data, tenantId);
+        if (!data.professionalOptionNames.isEmpty()) {
+          data.stageAttempts++;
+        }
+        return withHandoffIfNeeded(data, buildProfessionalPrompt(data, tenantId));
       }
 
       data.professionalOptionIds.clear();
@@ -463,6 +692,12 @@ public class AssistantConversationService {
 
       if (data.time == null) {
         data.stage = ConversationStage.ASK_TIME;
+        String bestSlot = data.availableTimeOptions.isEmpty() ? null : data.availableTimeOptions.get(0);
+        java.util.Optional<String> llmTime = ollamaResponseService.generateTimeSlotsMessage(
+            data.preferredPeriod.label(), data.availableTimeOptions, bestSlot);
+        if (llmTime.isPresent()) {
+          return llmTime.get();
+        }
         return "Qual horário de " + data.preferredPeriod.label() + " fica bom? Escolha pelo número:\n"
             + buildNumberedTimeList(data.availableTimeOptions)
             + "\nOu fala outro período ou \"trocar dia\". 😊";
@@ -665,6 +900,19 @@ public class AssistantConversationService {
     return value.length() == 5 ? value : value.substring(0, 5);
   }
 
+  /**
+   * Acrescenta sugestão de atendente humano ao final da mensagem quando o usuário
+   * fica preso num mesmo estágio por 3 ou mais tentativas consecutivas.
+   */
+  private String withHandoffIfNeeded(ConversationData data, String base) {
+    if (data.stageAttempts >= 3) {
+      String suggestion = ollamaResponseService.generateHandoffSuggestion()
+          .orElse("Estou com dificuldade de entender 😅 Quer falar com uma atendente? Responde SIM! 👩");
+      return base + "\n\n" + suggestion;
+    }
+    return base;
+  }
+
   private String buildProfessionalPrompt(ConversationData data, String tenantId) {
     List<ProfissionalDto> options = domainService.listProfessionalsByService(tenantId, data.serviceId);
     if (options.isEmpty()) {
@@ -683,6 +931,12 @@ public class AssistantConversationService {
       data.professionalOptionSpecialtyNames.add(specName != null ? specName : "");
     }
 
+    // Tenta resposta humanizada via LLM
+    java.util.Optional<String> llmReply = ollamaResponseService.generateProfessionalsMessage(
+        data.customerName, data.serviceName, options.subList(0, limit));
+    if (llmReply.isPresent()) {
+      return llmReply.get();
+    }
     return "Com quem você quer? Escolha pelo número ou nome:\n" + buildNumberedProfessionalList(options, limit);
   }
 
@@ -926,6 +1180,24 @@ public class AssistantConversationService {
         || normalized.equals("alterar dia");
   }
 
+  private boolean isPriceQuery(String normalized) {
+    if (normalized == null || normalized.isBlank()) return false;
+    return hasWord(normalized, "valor")
+        || hasWord(normalized, "preco")
+        || normalized.contains("quanto custa")
+        || normalized.contains("quanto cobram")
+        || normalized.contains("quanto fica")
+        || normalized.contains("qual o preco")
+        || normalized.contains("qual o valor")
+        || normalized.contains("quais os precos")
+        || normalized.contains("quais os valores")
+        || normalized.contains("tabela de preco")
+        || normalized.contains("lista de preco")
+        || normalized.contains("ver preco")
+        || normalized.contains("ver valor")
+        || (hasWord(normalized, "custa") && normalized.length() < 60);
+  }
+
   private boolean shouldPrioritizeSlotInput(ConversationData data, String rawMessage, String normalized) {
     if (wantsChangeDay(normalized)) {
       return data.serviceId != null && data.professionalId != null;
@@ -1019,6 +1291,72 @@ public class AssistantConversationService {
     data.availableTimeOptions.clear();
     data.appointmentOptionIds.clear();
     data.appointmentOptionLabels.clear();
+  }
+
+  // ─── Enriquecimento de datas ──────────────────────────────────────────────────
+
+  /**
+   * Substitui expressões de data relativas por datas ISO explícitas antes de enviar ao LLM.
+   *
+   * <p>Modelos menores (8B) são inconsistentes ao calcular "amanhã" a partir da data
+   * do system prompt. Resolver em Java garante 100% de precisão.</p>
+   *
+   * <p>Exemplos:</p>
+   * <ul>
+   *   <li>"amanhã às 10h"         → "2026-03-28 (amanhã) às 10h"</li>
+   *   <li>"depois de amanhã"      → "2026-03-29 (depois de amanhã)"</li>
+   *   <li>"hoje às 14h"           → "2026-03-27 (hoje) às 14h"</li>
+   *   <li>"na sexta"              → "na sexta (2026-03-28)"</li>
+   *   <li>"semana que vem"        → "semana que vem (a partir de 2026-04-03)"</li>
+   * </ul>
+   */
+  private String enrichDatesInMessage(String message) {
+    if (message == null || message.isBlank()) return message;
+
+    LocalDate today        = LocalDate.now();
+    LocalDate tomorrow     = today.plusDays(1);
+    LocalDate afterTomorrow = today.plusDays(2);
+
+    // Ordem importa: "depois de amanhã" antes de "amanhã"
+    String result = message
+        .replaceAll("(?i)\\bdepois\\s+de\\s+amanhã\\b",
+            "depois de amanhã (" + afterTomorrow + ")")
+        .replaceAll("(?i)\\bamanhã\\b",
+            "amanhã (" + tomorrow + ")")
+        .replaceAll("(?i)\\bhoje\\b",
+            "hoje (" + today + ")")
+        .replaceAll("(?i)\\bessa\\s+semana\\b",
+            "essa semana (de " + today + " a " + today.with(DayOfWeek.SUNDAY) + ")")
+        .replaceAll("(?i)\\bsemana\\s+que\\s+vem\\b",
+            "semana que vem (a partir de " + today.plusWeeks(1).with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY)) + ")");
+
+    // Dias da semana → próxima ocorrência futura
+    result = resolveDayOfWeek(result, "segunda(?:-feira)?", DayOfWeek.MONDAY,  today);
+    result = resolveDayOfWeek(result, "terça(?:-feira)?",   DayOfWeek.TUESDAY,  today);
+    result = resolveDayOfWeek(result, "quarta(?:-feira)?",  DayOfWeek.WEDNESDAY, today);
+    result = resolveDayOfWeek(result, "quinta(?:-feira)?",  DayOfWeek.THURSDAY, today);
+    result = resolveDayOfWeek(result, "sexta(?:-feira)?",   DayOfWeek.FRIDAY,   today);
+    result = resolveDayOfWeek(result, "sábado|sabado",      DayOfWeek.SATURDAY, today);
+    result = resolveDayOfWeek(result, "domingo",            DayOfWeek.SUNDAY,   today);
+
+    if (!result.equals(message)) {
+      LOG.debugf("[Agent] Datas enriquecidas: '%s' → '%s'", message, result);
+    }
+    return result;
+  }
+
+  /** Substitui o nome do dia por "nome (YYYY-MM-DD)" usando a próxima ocorrência futura. */
+  private String resolveDayOfWeek(String text, String dayPattern, DayOfWeek dow, LocalDate today) {
+    // Próxima ocorrência: se hoje é sexta e usuário diz "sexta", assume próxima sexta (não hoje)
+    LocalDate next = today.plusDays(1).with(TemporalAdjusters.nextOrSame(dow));
+    Pattern p = Pattern.compile("(?i)(?:na\\s+|no\\s+|na\\s+próxima\\s+|no\\s+próximo\\s+)?(" + dayPattern + ")", Pattern.UNICODE_CASE);
+    Matcher m = p.matcher(text);
+    StringBuffer sb = new StringBuffer();
+    while (m.find()) {
+      m.appendReplacement(sb, m.group(0).trim() + " (" + next + ")");
+    }
+    m.appendTail(sb);
+    return sb.toString();
   }
 
   private boolean shouldDeleteConversationState(ConversationData data) {

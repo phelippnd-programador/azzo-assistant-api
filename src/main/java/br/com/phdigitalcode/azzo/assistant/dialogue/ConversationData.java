@@ -29,6 +29,14 @@ public class ConversationData {
   public List<String> availableTimeOptions = new ArrayList<>();
   public List<String> appointmentOptionIds = new ArrayList<>();
   public List<String> appointmentOptionLabels = new ArrayList<>();
+  public int stageAttempts = 0;
+  /** Histórico completo da conversa enviado ao LLM a cada turno. */
+  public List<ChatMessage> chatHistory = new ArrayList<>();
+  /**
+   * Provider LLM ativo nesta conversa: "GROQ" | "OLLAMA" | null (nova conversa).
+   * Sticky: uma vez definido, mantém o mesmo provider até a conversa terminar.
+   */
+  public String activeProvider;
 
   public void reset() {
     stage = ConversationStage.START;
@@ -50,5 +58,8 @@ public class ConversationData {
     availableTimeOptions.clear();
     appointmentOptionIds.clear();
     appointmentOptionLabels.clear();
+    stageAttempts = 0;
+    chatHistory.clear();
+    activeProvider = null;
   }
 }

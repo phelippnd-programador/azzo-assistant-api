@@ -1,6 +1,7 @@
 ﻿/target/
 privateKey.pem
 publicKey.pem
+.env
 
 # IDE
 /.idea/

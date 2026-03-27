@@ -11,6 +11,7 @@ import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.Notificacao
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ProfissionalDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ServicoDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.TimeSlotDto;
+import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.SalonInfoDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.WhatsAppPermissoesDto;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.GET;
@@ -109,4 +110,10 @@ public interface AgendaProInternalClient {
   @GET
   @Path("/api/v1/internal/assistant/tenant/whatsapp-permissions")
   WhatsAppPermissoesDto obterPermissoesWhatsApp(@QueryParam("tenantId") String tenantId);
+
+  // ─── Info do Tenant ──────────────────────────────────────────────────────
+
+  @GET
+  @Path("/api/v1/internal/assistant/tenant/info")
+  SalonInfoDto obterInfoTenant(@QueryParam("tenantId") String tenantId);
 }
