@@ -13,6 +13,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.AgendaProInternalClient;
+import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.HorarioFuncionamentoDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ProfissionalDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.SalonInfoDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ServicoDto;
@@ -93,6 +94,7 @@ public class AgentSystemPromptBuilder {
         String salonName = fetchSalonName(tenantId);
         List<ServicoDto> services = fetchServices(tenantId);
         List<ProfissionalDto> professionals = fetchProfessionals(tenantId);
+        List<HorarioFuncionamentoDto> schedule = fetchSchedule(tenantId);
 
         Map<String, String> serviceAliasToId = new LinkedHashMap<>();
         Map<String, String> professionalAliasToId = new LinkedHashMap<>();
@@ -185,6 +187,24 @@ Se o cliente pedir uma data anterior a hoje, recuse com naturalidade:
             sb.append("\n");
         }
 
+        // Horários de funcionamento
+        sb.append("\n=== QUANDO O SALÃO ABRE ===\n");
+        if (schedule.isEmpty()) {
+            sb.append("Horários não configurados — oriente o cliente a ligar para confirmar.\n");
+        } else {
+            for (HorarioFuncionamentoDto h : schedule) {
+                String dayLabel = normalizeDayLabel(h.day);
+                if (!h.enabled) {
+                    sb.append(dayLabel).append(": FECHADO\n");
+                } else {
+                    sb.append(dayLabel).append(": ").append(h.open).append(" às ").append(h.close).append("\n");
+                }
+            }
+            sb.append("→ SOMENTE mencione dia fechado se o cliente pedir explicitamente um agendamento em um dia que aparece como FECHADO acima.\n");
+            sb.append("→ NÃO mencione dias fechados proativamente, NÃO mencione feriados — não existe controle de feriados neste sistema.\n");
+            sb.append("→ Se perguntarem sobre horários, responda APENAS com os dados acima, sem adicionar informações.\n");
+        }
+
         // Fluxo e ações
         sb.append("""
 
@@ -204,6 +224,7 @@ Para cancelar um agendamento existente:
 
 === REGRAS QUE NUNCA QUEBRAM ===
 - Os preços e serviços listados acima são os únicos que existem — NUNCA invente ou altere valores.
+- NUNCA mencione feriados — o sistema não tem controle de feriados.
 - Se o cliente perguntar sobre algo fora do salão: "Sou especialista em beleza, posso ajudar com agendamentos! 💅"
 - Datas relativas ("amanhã", "sexta que vem"): calcule a partir de hoje.
 - Os aliases S1, P1 etc. são só para as ações do sistema — NUNCA mencione para o cliente.
@@ -247,6 +268,34 @@ Para cancelar um agendamento existente:
             LOG.warnf("[AgentPrompt] Falha ao buscar profissionais: %s", e.getMessage());
             return List.of();
         }
+    }
+
+    private List<HorarioFuncionamentoDto> fetchSchedule(String tenantId) {
+        try {
+            List<HorarioFuncionamentoDto> list = agendaProClient.listarHorariosFuncionamento(tenantId);
+            return list != null ? list : List.of();
+        } catch (RuntimeException e) {
+            LOG.warnf("[AgentPrompt] Falha ao buscar horários de funcionamento: %s", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Normaliza o nome do dia vindo do banco ("Terca-feira", "Sabado"...)
+     * para a forma acentuada legível pelo LLM ("Terça-feira", "Sábado"...).
+     */
+    private String normalizeDayLabel(String day) {
+        if (day == null) return "?";
+        return switch (day.trim().toLowerCase()) {
+            case "segunda-feira", "segunda" -> "Segunda-feira";
+            case "terca-feira", "terca"     -> "Terça-feira";
+            case "quarta-feira", "quarta"   -> "Quarta-feira";
+            case "quinta-feira", "quinta"   -> "Quinta-feira";
+            case "sexta-feira", "sexta"     -> "Sexta-feira";
+            case "sabado", "sábado"         -> "Sábado";
+            case "domingo"                  -> "Domingo";
+            default                         -> day;
+        };
     }
 
     private String formatDuration(int minutes) {
