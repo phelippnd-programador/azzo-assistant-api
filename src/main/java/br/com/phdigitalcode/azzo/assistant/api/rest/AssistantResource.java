@@ -6,7 +6,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import java.util.UUID;
+
 import br.com.phdigitalcode.azzo.assistant.application.service.AssistantConversationService;
+import br.com.phdigitalcode.azzo.assistant.application.service.ConversationStateManager;
 import br.com.phdigitalcode.azzo.assistant.domain.entity.LlmUsageDailyEntity;
 import br.com.phdigitalcode.azzo.assistant.domain.repository.LlmUsageRepository;
 import br.com.phdigitalcode.azzo.assistant.llm.AgentSystemPromptBuilder;
@@ -36,6 +39,7 @@ public class AssistantResource {
   @Inject LlmRouter                    llmRouter;
   @Inject LlmUsageRepository           usageRepository;
   @Inject AgentSystemPromptBuilder     agentSystemPromptBuilder;
+  @Inject ConversationStateManager     stateManager;
 
   /**
    * Processa uma mensagem do usuário via WhatsApp.
@@ -52,6 +56,34 @@ public class AssistantResource {
       @HeaderParam("X-User-Identifier") String userIdentifier,
       @HeaderParam("X-User-Name") String userName) {
     return conversationService.process(request.message, userIdentifier, userName);
+  }
+
+  /**
+   * Pré-semeia um contexto de confirmação de presença para um cliente.
+   * Deve ser chamado imediatamente após enviar o lembrete automático via WhatsApp,
+   * para que a resposta do cliente seja interpretada como confirmação/cancelamento
+   * do agendamento existente — e não como início de um novo fluxo de booking.
+   */
+  @POST
+  @Path("/admin/seed-reminder")
+  public Map<String, Object> seedReminder(
+      @QueryParam("tenantId")      String tenantId,
+      @QueryParam("userIdentifier") String userIdentifier,
+      @QueryParam("appointmentId") String appointmentId,
+      @QueryParam("customerName")  String customerName) {
+    if (tenantId == null || userIdentifier == null || appointmentId == null) {
+      return Map.of("status", "ERROR", "message", "tenantId, userIdentifier e appointmentId são obrigatórios");
+    }
+    try {
+      stateManager.seedReminderContext(
+          UUID.fromString(tenantId),
+          userIdentifier,
+          UUID.fromString(appointmentId),
+          customerName != null ? customerName : "");
+      return Map.of("status", "OK", "appointmentId", appointmentId, "userIdentifier", userIdentifier);
+    } catch (IllegalArgumentException e) {
+      return Map.of("status", "ERROR", "message", "UUID inválido: " + e.getMessage());
+    }
   }
 
   /**

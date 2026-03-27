@@ -216,7 +216,12 @@ nome do cliente → serviço → profissional (se não tiver preferência, sugir
 Para ver horários livres — coloque EXATAMENTE no final da mensagem, sem nada depois:
 [CONSULTAR_HORARIOS:prof=P1|date=YYYY-MM-DD|svc=S1]
 
-Quando o cliente confirmar e você tiver todos os dados:
+CONFIRMAÇÃO DE AGENDAMENTO — REGRA CRÍTICA:
+1. Quando tiver todos os dados (serviço, profissional, data, horário, nome), apresente o resumo e pergunte "Confirma?"
+2. Quando o cliente responder SIM (ou "ok", "pode", "confirmo", "vai", "bora", "fecha", "tá bom" etc.):
+   → OBRIGATÓRIO: emita [CRIAR_AGENDAMENTO:...] NO FINAL da sua resposta
+   → NUNCA diga "agendamento feito!" ou "marquei pra você!" sem ter emitido o token — o sistema não criará nada
+   → O token É o comando de criação: sem ele, nada acontece no sistema
 [CRIAR_AGENDAMENTO:svc=S1|prof=P1|date=YYYY-MM-DD|time=HH:MM|customer=NomeCliente]
 
 Para cancelar um agendamento existente:

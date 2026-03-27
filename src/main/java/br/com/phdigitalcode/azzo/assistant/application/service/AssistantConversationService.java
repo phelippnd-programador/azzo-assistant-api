@@ -149,6 +149,13 @@ public class AssistantConversationService {
   private String handleMessageAgent(ConversationData data, String rawMessage,
       String userIdentifier, String tenantId) {
 
+    // Confirmação de presença via lembrete automático — tratamento determinístico,
+    // sem envolver o LLM. Tem prioridade sobre qualquer outro estágio.
+    if (data.stage == ConversationStage.AWAITING_APPOINTMENT_CONFIRMATION) {
+      String normalized = TextNormalizer.normalize(rawMessage);
+      return handleReminderConfirmation(data, normalized, userIdentifier, tenantId);
+    }
+
     // Conversa anterior finalizada → limpa slots para nova sessão, mas mantém nome do cliente
     if (data.stage == ConversationStage.COMPLETED) {
       LOG.debugf("[Agent] Stage=COMPLETED — resetando slots para nova conversa");
@@ -176,6 +183,28 @@ public class AssistantConversationService {
     // Persiste o provider escolhido para manter sticky durante toda a conversa
     if (result.providerUsed() != null) {
       data.activeProvider = result.providerUsed();
+    }
+
+    // Safety net: se o LLM pediu confirmação, o cliente confirmou, mas o LLM esqueceu de
+    // emitir [CRIAR_AGENDAMENTO], re-chama com hint explícito (1 tentativa).
+    if (result.actions().isEmpty()
+        && isConfirmationPending(data.chatHistory)
+        && isAffirmativeResponse(rawMessage)) {
+      LOG.infof("[Agent] Confirmação detectada sem action token — re-chamando LLM com hint");
+      List<ChatMessage> tempHistory = new ArrayList<>(data.chatHistory);
+      tempHistory.add(new ChatMessage("user", enrichedMessage));
+      tempHistory.add(new ChatMessage("tool",
+          "[Sistema: o cliente acabou de confirmar o agendamento. "
+          + "Emita OBRIGATORIAMENTE [CRIAR_AGENDAMENTO:...] com todos os dados coletados na conversa. "
+          + "Sem esse token, nenhum agendamento será criado no sistema.]"));
+      LlmBookingAgent.AgentResult retry = llmBookingAgent.chat(
+          systemPrompt, tempHistory, "", data.activeProvider);
+      if (retry.hasAction("CRIAR_AGENDAMENTO")) {
+        LOG.infof("[Agent] Re-chamada retornou CRIAR_AGENDAMENTO — usando resultado do retry");
+        result = retry;
+      } else {
+        LOG.warnf("[Agent] Re-chamada ainda sem CRIAR_AGENDAMENTO — seguindo com resultado original");
+      }
     }
 
     // Processa ações — max 1 round-trip para evitar loops
@@ -345,6 +374,13 @@ public class AssistantConversationService {
 
   private String handleMessage(ConversationData data, String rawMessage, String userIdentifier, String tenantId) {
     String normalized = TextNormalizer.normalize(rawMessage);
+
+    // Confirmação de presença via lembrete automático — tratamento determinístico,
+    // independente do fluxo de booking. Tem prioridade sobre qualquer outro estágio.
+    if (data.stage == ConversationStage.AWAITING_APPOINTMENT_CONFIRMATION) {
+      return handleReminderConfirmation(data, normalized, userIdentifier, tenantId);
+    }
+
     boolean prioritizeSlotInput = shouldPrioritizeSlotInput(data, rawMessage, normalized);
     if (!prioritizeSlotInput && isDeterministicGreeting(normalized) && data.stage != ConversationStage.CONFIRMATION) {
       return greetingReplyForCurrentStage(data, tenantId);
@@ -1513,6 +1549,81 @@ public class AssistantConversationService {
            "nao quero", "nao obrigado" -> true;
       default -> false;
     };
+  }
+
+  /**
+   * Lida com a resposta do cliente ao lembrete automático de agendamento.
+   * O contexto foi pré-semeado pelo ReminderScheduler com stage=AWAITING_APPOINTMENT_CONFIRMATION.
+   * Processa deterministicamente: sem LLM, sem novo fluxo de booking.
+   */
+  private String handleReminderConfirmation(ConversationData data, String normalized,
+      String userIdentifier, String tenantId) {
+    if (data.appointmentId == null) {
+      // Estado corrompido — reinicia sem travar o usuário
+      data.reset();
+      return "Oi! Como posso te ajudar hoje? 😊";
+    }
+
+    String nome = (data.customerName != null && !data.customerName.isBlank())
+        ? ", " + data.customerName : "";
+
+    if (isInformalAffirmative(normalized) || DateTimeRegexExtractor.isAffirmative(normalized)
+        || normalized.contains("confirmar") || normalized.contains("confirmo")) {
+      try {
+        domainService.confirmAppointment(tenantId, data.appointmentId, userIdentifier);
+        data.reset();
+        LOG.infof("[Reminder] Presença confirmada: appointment=%s user=%s", data.appointmentId, userIdentifier);
+        return "Presença confirmada" + nome + "! ✅ Te esperamos. Se precisar de algo, é só chamar. 😊";
+      } catch (Exception e) {
+        LOG.warnf("[Reminder] Erro ao confirmar presença: %s", e.getMessage());
+        data.reset();
+        return "Tive um problema ao confirmar. Por favor, entre em contato com o salão. 😕";
+      }
+    }
+
+    if (isInformalNegative(normalized) || DateTimeRegexExtractor.isNegative(normalized)
+        || normalized.contains("cancelar") || normalized.contains("cancelo")) {
+      try {
+        domainService.cancelAppointmentForUser(tenantId, userIdentifier, data.appointmentId);
+        data.reset();
+        LOG.infof("[Reminder] Agendamento cancelado via lembrete: appointment=%s user=%s", data.appointmentId, userIdentifier);
+        return "Agendamento cancelado" + nome + ". 😊 Quando quiser remarcar, é só chamar!";
+      } catch (Exception e) {
+        LOG.warnf("[Reminder] Erro ao cancelar via lembrete: %s", e.getMessage());
+        data.reset();
+        return "Tive um problema ao cancelar. Por favor, entre em contato com o salão. 😕";
+      }
+    }
+
+    return "Não entendi" + nome + ". Responde *CONFIRMAR* pra confirmar sua presença ou *CANCELAR* pra cancelar o agendamento. 😊";
+  }
+
+  /**
+   * Verifica se a última mensagem do assistente no histórico foi um pedido de confirmação
+   * de agendamento. Usado pelo safety net do modo agente para detectar quando o LLM
+   * esqueceu de emitir [CRIAR_AGENDAMENTO] após o cliente confirmar.
+   */
+  private boolean isConfirmationPending(List<ChatMessage> history) {
+    if (history == null || history.isEmpty()) return false;
+    for (int i = history.size() - 1; i >= 0; i--) {
+      ChatMessage msg = history.get(i);
+      if (!"assistant".equals(msg.role)) continue;
+      String c = TextNormalizer.normalize(msg.content);
+      return c.contains("confirma") || c.contains("pode confirmar")
+          || c.contains("confirmar o agendamento") || c.contains("confirma o agendamento")
+          || c.contains("posso confirmar") || c.contains("confirmar?");
+    }
+    return false;
+  }
+
+  /**
+   * Verifica se a mensagem do usuário é uma resposta afirmativa — reutiliza os mesmos
+   * padrões deterministicos do fluxo de máquina de estados.
+   */
+  private boolean isAffirmativeResponse(String rawMessage) {
+    if (rawMessage == null || rawMessage.isBlank()) return false;
+    String normalized = TextNormalizer.normalize(rawMessage);
+    return isInformalAffirmative(normalized) || DateTimeRegexExtractor.isAffirmative(normalized);
   }
 
   private boolean hasWord(String text, String word) {
