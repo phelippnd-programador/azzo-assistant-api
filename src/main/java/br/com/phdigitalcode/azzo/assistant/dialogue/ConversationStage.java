@@ -17,5 +17,6 @@ public enum ConversationStage {
    * O assistente aguarda o cliente responder CONFIRMAR ou CANCELAR para um
    * agendamento já existente — sem iniciar um novo fluxo de booking.
    */
-  AWAITING_APPOINTMENT_CONFIRMATION
+  AWAITING_APPOINTMENT_CONFIRMATION,
+  AWAITING_REACTIVATION_REPLY
 }

@@ -1,6 +1,7 @@
 package br.com.phdigitalcode.azzo.assistant.application.service;
 
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.UUID;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -15,11 +16,6 @@ import jakarta.inject.Inject;
 import jakarta.transaction.Transactional;
 import org.jboss.logging.Logger;
 
-/**
- * Responsável exclusivamente pelas operações de banco de dados do estado de conversa.
- * Cada método abre e fecha sua própria transação rapidamente (< 50ms), sem segurar
- * conexão durante chamadas lentas ao LLM.
- */
 @ApplicationScoped
 public class ConversationStateManager {
 
@@ -31,10 +27,6 @@ public class ConversationStateManager {
     @Inject
     ObjectMapper objectMapper;
 
-    /**
-     * Limpa estados expirados e retorna (ou cria) a entidade ativa para o usuário.
-     * Transação curta: apenas operações de leitura/criação no DB.
-     */
     @Transactional
     public ConversationStateEntity loadOrCreate(UUID tenantId, String userIdentifier, Instant threshold) {
         stateRepository.deleteExpired(threshold);
@@ -42,10 +34,6 @@ public class ConversationStateManager {
                 .orElseGet(() -> createNew(tenantId, userIdentifier));
     }
 
-    /**
-     * Persiste o estado atualizado após o LLM ter respondido.
-     * Transação curta: apenas um UPDATE/INSERT.
-     */
     @Transactional
     public void save(ConversationStateEntity entity, String stateJson) {
         entity.stateJson = stateJson;
@@ -53,9 +41,6 @@ public class ConversationStateManager {
         stateRepository.save(entity);
     }
 
-    /**
-     * Remove o estado (conversa concluída ou reiniciada).
-     */
     @Transactional
     public void delete(ConversationStateEntity entity) {
         if (entity.isPersistent()) {
@@ -63,21 +48,8 @@ public class ConversationStateManager {
         }
     }
 
-    /**
-     * Pré-semeia um contexto de confirmação de presença para o cliente.
-     * Chamado pelo ReminderScheduler imediatamente após enviar o lembrete via WhatsApp.
-     *
-     * Quando o cliente responder, o assistente encontrará este estado e processará
-     * a resposta como confirmação/cancelamento do agendamento existente — sem iniciar
-     * um novo fluxo de booking.
-     *
-     * Se já existir uma conversa ativa para este usuário, ela é substituída, pois
-     * a confirmação de presença tem prioridade.
-     */
     @Transactional
-    public void seedReminderContext(UUID tenantId, String userIdentifier,
-            UUID appointmentId, String customerName) {
-        // Remove qualquer estado anterior para não haver conflito
+    public void seedReminderContext(UUID tenantId, String userIdentifier, UUID appointmentId, String customerName) {
         stateRepository.findActive(tenantId, userIdentifier, Instant.EPOCH)
                 .ifPresent(stateRepository::delete);
 
@@ -94,11 +66,51 @@ public class ConversationStateManager {
         entity.updatedAt = Instant.now();
         stateRepository.save(entity);
 
-        LOG.infof("[StateManager] Contexto de confirmação de presença criado: tenant=%s user=%s appointment=%s",
+        LOG.infof("[StateManager] Reminder context created: tenant=%s user=%s appointment=%s",
                 tenantId, userIdentifier, appointmentId);
     }
 
-    // ─── Helpers ──────────────────────────────────────────────────────────────
+    @Transactional
+    public void seedReactivationContext(
+            UUID tenantId,
+            String userIdentifier,
+            UUID cycleId,
+            String customerName,
+            String resumeStage,
+            String serviceId,
+            String serviceName,
+            String professionalId,
+            String professionalName,
+            String date,
+            String time,
+            String assistantLastPrompt) {
+        stateRepository.findActive(tenantId, userIdentifier, Instant.EPOCH)
+                .ifPresent(stateRepository::delete);
+
+        ConversationData data = new ConversationData();
+        data.stage = ConversationStage.AWAITING_REACTIVATION_REPLY;
+        data.reactivationCycleId = cycleId;
+        data.customerName = customerName;
+        data.userIdentifier = userIdentifier;
+        data.reactivationResumeStage = parseStage(resumeStage);
+        data.serviceId = parseUuid(serviceId);
+        data.serviceName = serviceName;
+        data.professionalId = parseUuid(professionalId);
+        data.professionalName = professionalName;
+        data.date = parseLocalDate(date);
+        data.time = time;
+        data.reactivationLastPrompt = assistantLastPrompt;
+
+        ConversationStateEntity entity = new ConversationStateEntity();
+        entity.tenantId = tenantId;
+        entity.userIdentifier = userIdentifier;
+        entity.stateJson = toJson(data);
+        entity.updatedAt = Instant.now();
+        stateRepository.save(entity);
+
+        LOG.infof("[StateManager] Reactivation context created: tenant=%s user=%s cycle=%s stage=%s",
+                tenantId, userIdentifier, cycleId, data.reactivationResumeStage);
+    }
 
     public String toJson(ConversationData data) {
         try {
@@ -124,5 +136,32 @@ public class ConversationStateManager {
         entity.stateJson = toJson(new ConversationData());
         entity.updatedAt = Instant.now();
         return entity;
+    }
+
+    private UUID parseUuid(String value) {
+        if (value == null || value.isBlank()) return null;
+        try {
+            return UUID.fromString(value);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private LocalDate parseLocalDate(String value) {
+        if (value == null || value.isBlank()) return null;
+        try {
+            return LocalDate.parse(value);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private ConversationStage parseStage(String value) {
+        if (value == null || value.isBlank()) return ConversationStage.ASK_SERVICE;
+        try {
+            return ConversationStage.valueOf(value.trim());
+        } catch (Exception ignored) {
+            return ConversationStage.ASK_SERVICE;
+        }
     }
 }

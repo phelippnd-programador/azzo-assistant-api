@@ -4,9 +4,8 @@ import java.time.LocalDate;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
-
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import br.com.phdigitalcode.azzo.assistant.application.service.AssistantConversationService;
 import br.com.phdigitalcode.azzo.assistant.application.service.ConversationStateManager;
@@ -16,6 +15,7 @@ import br.com.phdigitalcode.azzo.assistant.llm.AgentSystemPromptBuilder;
 import br.com.phdigitalcode.azzo.assistant.llm.LlmRouter;
 import br.com.phdigitalcode.azzo.assistant.model.AssistantMessageRequest;
 import br.com.phdigitalcode.azzo.assistant.model.AssistantMessageResponse;
+import br.com.phdigitalcode.azzo.assistant.model.AssistantReactivationSeedRequest;
 import br.com.phdigitalcode.azzo.assistant.training.OpenNLPModelTrainer;
 import jakarta.inject.Inject;
 import jakarta.validation.Valid;
@@ -35,20 +35,12 @@ import jakarta.ws.rs.core.MediaType;
 public class AssistantResource {
 
   @Inject AssistantConversationService conversationService;
-  @Inject OpenNLPModelTrainer          modelTrainer;
-  @Inject LlmRouter                    llmRouter;
-  @Inject LlmUsageRepository           usageRepository;
-  @Inject AgentSystemPromptBuilder     agentSystemPromptBuilder;
-  @Inject ConversationStateManager     stateManager;
+  @Inject OpenNLPModelTrainer modelTrainer;
+  @Inject LlmRouter llmRouter;
+  @Inject LlmUsageRepository usageRepository;
+  @Inject AgentSystemPromptBuilder agentSystemPromptBuilder;
+  @Inject ConversationStateManager stateManager;
 
-  /**
-   * Processa uma mensagem do usuário via WhatsApp.
-   *
-   * Headers obrigatórios:
-   * - X-Tenant-Id: UUID do tenant (enviado pelo backend principal)
-   * - X-User-Identifier: telefone ou e-mail do usuário
-   * - X-User-Name: nome do usuário (opcional, vindo do WhatsApp profile)
-   */
   @POST
   @Path("/message")
   public AssistantMessageResponse message(
@@ -58,21 +50,15 @@ public class AssistantResource {
     return conversationService.process(request.message, userIdentifier, userName);
   }
 
-  /**
-   * Pré-semeia um contexto de confirmação de presença para um cliente.
-   * Deve ser chamado imediatamente após enviar o lembrete automático via WhatsApp,
-   * para que a resposta do cliente seja interpretada como confirmação/cancelamento
-   * do agendamento existente — e não como início de um novo fluxo de booking.
-   */
   @POST
   @Path("/admin/seed-reminder")
   public Map<String, Object> seedReminder(
-      @QueryParam("tenantId")      String tenantId,
+      @QueryParam("tenantId") String tenantId,
       @QueryParam("userIdentifier") String userIdentifier,
       @QueryParam("appointmentId") String appointmentId,
-      @QueryParam("customerName")  String customerName) {
+      @QueryParam("customerName") String customerName) {
     if (tenantId == null || userIdentifier == null || appointmentId == null) {
-      return Map.of("status", "ERROR", "message", "tenantId, userIdentifier e appointmentId são obrigatórios");
+      return Map.of("status", "ERROR", "message", "tenantId, userIdentifier e appointmentId sao obrigatorios");
     }
     try {
       stateManager.seedReminderContext(
@@ -82,29 +68,49 @@ public class AssistantResource {
           customerName != null ? customerName : "");
       return Map.of("status", "OK", "appointmentId", appointmentId, "userIdentifier", userIdentifier);
     } catch (IllegalArgumentException e) {
-      return Map.of("status", "ERROR", "message", "UUID inválido: " + e.getMessage());
+      return Map.of("status", "ERROR", "message", "UUID invalido: " + e.getMessage());
     }
   }
 
-  /**
-   * Invalida o cache do system prompt para um tenant específico.
-   * Deve ser chamado após alterações de horários, serviços ou profissionais
-   * para que o LLM receba os dados atualizados imediatamente.
-   */
+  @POST
+  @Path("/admin/seed-reactivation")
+  public Map<String, Object> seedReactivation(
+      @QueryParam("tenantId") String tenantId,
+      @QueryParam("userIdentifier") String userIdentifier,
+      @Valid AssistantReactivationSeedRequest request) {
+    if (tenantId == null || tenantId.isBlank() || userIdentifier == null || userIdentifier.isBlank() || request == null) {
+      return Map.of("status", "ERROR", "message", "tenantId, userIdentifier e payload sao obrigatorios");
+    }
+    try {
+      stateManager.seedReactivationContext(
+          UUID.fromString(tenantId),
+          userIdentifier,
+          request.cycleId == null || request.cycleId.isBlank() ? null : UUID.fromString(request.cycleId),
+          request.customerName,
+          request.resumeStage,
+          request.serviceId,
+          request.serviceName,
+          request.professionalId,
+          request.professionalName,
+          request.date,
+          request.time,
+          request.assistantLastPrompt);
+      return Map.of("status", "OK", "tenantId", tenantId, "userIdentifier", userIdentifier);
+    } catch (IllegalArgumentException e) {
+      return Map.of("status", "ERROR", "message", "UUID invalido: " + e.getMessage());
+    }
+  }
+
   @DELETE
   @Path("/admin/cache")
   public Map<String, Object> invalidateCache(@QueryParam("tenantId") String tenantId) {
     if (tenantId == null || tenantId.isBlank()) {
-      return Map.of("status", "ERROR", "message", "tenantId é obrigatório");
+      return Map.of("status", "ERROR", "message", "tenantId e obrigatorio");
     }
     agentSystemPromptBuilder.invalidate(tenantId);
     return Map.of("status", "OK", "tenantId", tenantId, "message", "Cache do prompt invalidado com sucesso.");
   }
 
-  /**
-   * Força o retreinamento dos modelos OpenNLP.
-   * Usado após adicionar novos dados de treinamento.
-   */
   @POST
   @Path("/admin/retrain")
   public Map<String, Object> retrain() {
@@ -112,50 +118,36 @@ public class AssistantResource {
     return Map.of("status", "OK", "message", "Modelos OpenNLP retreinados com sucesso.");
   }
 
-  /**
-   * Retorna métricas de uso diário do LLM.
-   *
-   * <p>Mostra o uso atual do Groq em relação ao limite diário configurado,
-   * além do histórico dos últimos N dias (padrão: 7). Use junto com o
-   * <a href="https://console.groq.com">Groq Console</a> para métricas detalhadas
-   * de tokens e latência.</p>
-   *
-   * <p>Exemplo: GET /api/v1/assistant/admin/metrics?days=30</p>
-   */
   @GET
   @Path("/admin/metrics")
   public Map<String, Object> metrics(@QueryParam("days") Integer days) {
     int lookbackDays = (days != null && days > 0 && days <= 90) ? days : 7;
 
-    int todayGroq   = llmRouter.getDailyGroqCount();
+    int todayGroq = llmRouter.getDailyGroqCount();
     int todayOllama = usageRepository.getCount(LocalDate.now(), "OLLAMA");
-    int dailyLimit  = llmRouter.getGroqDailyLimit();
+    int dailyLimit = llmRouter.getGroqDailyLimit();
 
     List<LlmUsageDailyEntity> history = usageRepository.getRecentUsage(lookbackDays);
-
-    // Agrupa por data para facilitar leitura no frontend
     Map<String, Map<String, Integer>> historyByDate = history.stream()
         .collect(Collectors.groupingBy(
             e -> e.usageDate.toString(),
             LinkedHashMap::new,
-            Collectors.toMap(e -> e.provider, e -> e.requestCount)
-        ));
+            Collectors.toMap(e -> e.provider, e -> e.requestCount)));
 
     Map<String, Object> today = new LinkedHashMap<>();
-    today.put("groq_requests",    todayGroq);
-    today.put("groq_limit",       dailyLimit);
-    today.put("groq_remaining",   Math.max(0, dailyLimit - todayGroq));
-    today.put("groq_usage_pct",   dailyLimit > 0 ? Math.round((todayGroq * 100.0) / dailyLimit) : 0);
-    today.put("ollama_requests",  todayOllama);
-    today.put("total_requests",   todayGroq + todayOllama);
+    today.put("groq_requests", todayGroq);
+    today.put("groq_limit", dailyLimit);
+    today.put("groq_remaining", Math.max(0, dailyLimit - todayGroq));
+    today.put("groq_usage_pct", dailyLimit > 0 ? Math.round((todayGroq * 100.0) / dailyLimit) : 0);
+    today.put("ollama_requests", todayOllama);
+    today.put("total_requests", todayGroq + todayOllama);
 
     Map<String, Object> result = new LinkedHashMap<>();
-    result.put("today",            today);
-    result.put("circuit_breaker",  llmRouter.getCircuitBreakerStatus());
-    result.put("history_days",     lookbackDays);
-    result.put("history",          historyByDate);
-    result.put("groq_console",     "https://console.groq.com/usage");
-
+    result.put("today", today);
+    result.put("circuit_breaker", llmRouter.getCircuitBreakerStatus());
+    result.put("history_days", lookbackDays);
+    result.put("history", historyByDate);
+    result.put("groq_console", "https://console.groq.com/usage");
     return result;
   }
 }

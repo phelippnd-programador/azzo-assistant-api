@@ -13,6 +13,7 @@ public class ConversationData {
   public String time;
   public UUID appointmentId;
   public UUID sourceAppointmentId;
+  public UUID reactivationCycleId;
   /** ID do agendamento selecionado para cancelar, aguardando confirmação do usuário. */
   public UUID pendingCancelAppointmentId;
   public String serviceName;
@@ -21,6 +22,8 @@ public class ConversationData {
   public String professionalSpecialtyName;
   public String customerName;
   public String userIdentifier;
+  public ConversationStage reactivationResumeStage;
+  public String reactivationLastPrompt;
   public TimePeriod preferredPeriod;
   public List<String> professionalOptionIds = new ArrayList<>();
   public List<String> professionalOptionNames = new ArrayList<>();
@@ -46,11 +49,14 @@ public class ConversationData {
     time = null;
     appointmentId = null;
     sourceAppointmentId = null;
+    reactivationCycleId = null;
     pendingCancelAppointmentId = null;
     serviceName = null;
     professionalName = null;
     professionalSpecialtyName = null;
     customerName = null;
+    reactivationResumeStage = null;
+    reactivationLastPrompt = null;
     preferredPeriod = null;
     professionalOptionIds.clear();
     professionalOptionNames.clear();

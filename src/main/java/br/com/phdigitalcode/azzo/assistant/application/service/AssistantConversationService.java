@@ -155,6 +155,10 @@ public class AssistantConversationService {
       String normalized = TextNormalizer.normalize(rawMessage);
       return handleReminderConfirmation(data, normalized, userIdentifier, tenantId);
     }
+    if (data.stage == ConversationStage.AWAITING_REACTIVATION_REPLY) {
+      String normalized = TextNormalizer.normalize(rawMessage);
+      return handleReactivationReply(data, rawMessage, normalized, userIdentifier, tenantId);
+    }
 
     // Conversa anterior finalizada → limpa slots para nova sessão, mas mantém nome do cliente
     if (data.stage == ConversationStage.COMPLETED) {
@@ -379,6 +383,9 @@ public class AssistantConversationService {
     // independente do fluxo de booking. Tem prioridade sobre qualquer outro estágio.
     if (data.stage == ConversationStage.AWAITING_APPOINTMENT_CONFIRMATION) {
       return handleReminderConfirmation(data, normalized, userIdentifier, tenantId);
+    }
+    if (data.stage == ConversationStage.AWAITING_REACTIVATION_REPLY) {
+      return handleReactivationReply(data, rawMessage, normalized, userIdentifier, tenantId);
     }
 
     boolean prioritizeSlotInput = shouldPrioritizeSlotInput(data, rawMessage, normalized);
@@ -1598,6 +1605,35 @@ public class AssistantConversationService {
     return "Não entendi" + nome + ". Responde *CONFIRMAR* pra confirmar sua presença ou *CANCELAR* pra cancelar o agendamento. 😊";
   }
 
+  private String handleReactivationReply(
+      ConversationData data,
+      String rawMessage,
+      String normalized,
+      String userIdentifier,
+      String tenantId) {
+    String nome = (data.customerName != null && !data.customerName.isBlank())
+        ? ", " + data.customerName : "";
+
+    if (isInformalNegative(normalized) || DateTimeRegexExtractor.isNegative(normalized)
+        || normalized.contains("nao quero") || normalized.contains("deixa pra la")) {
+      data.reset();
+      return "Tudo certo" + nome + ". Se quiser agendar depois, e so me chamar por aqui. ??";
+    }
+
+    ConversationStage resumeStage = data.reactivationResumeStage != null
+        ? data.reactivationResumeStage
+        : ConversationStage.ASK_SERVICE;
+    data.stage = resumeStage;
+    data.reactivationResumeStage = null;
+
+    if (isInformalAffirmative(normalized) || DateTimeRegexExtractor.isAffirmative(normalized)
+        || normalized.contains("quero") || normalized.contains("vamos")) {
+      return "Perfeito" + nome + "! Vamos retomar de onde paramos. " + greetingReplyForCurrentStage(data, tenantId);
+    }
+
+    return handleMessage(data, rawMessage, userIdentifier, tenantId);
+  }
+
   /**
    * Verifica se a última mensagem do assistente no histórico foi um pedido de confirmação
    * de agendamento. Usado pelo safety net do modo agente para detectar quando o LLM
@@ -1646,3 +1682,4 @@ public class AssistantConversationService {
     return Optional.empty();
   }
 }
+
