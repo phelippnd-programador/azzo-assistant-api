@@ -11,6 +11,8 @@ import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.util.Optional;
 import java.util.UUID;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -27,8 +29,11 @@ import br.com.phdigitalcode.azzo.assistant.dialogue.ConversationStage;
 import br.com.phdigitalcode.azzo.assistant.domain.entity.ConversationStateEntity;
 import br.com.phdigitalcode.azzo.assistant.extractor.ProfessionalNameFinder;
 import br.com.phdigitalcode.azzo.assistant.extractor.ServiceNameFinder;
+import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ServicoDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.tenant.ContextoTenant;
 import br.com.phdigitalcode.azzo.assistant.model.AssistantMessageResponse;
+import br.com.phdigitalcode.azzo.assistant.model.IntentPrediction;
+import br.com.phdigitalcode.azzo.assistant.model.IntentType;
 
 @ExtendWith(MockitoExtension.class)
 @DisplayName("AssistantConversationReactivation")
@@ -95,6 +100,36 @@ class AssistantConversationReactivationUnitTest {
         assertNotNull(response);
         assertEquals(ConversationStage.START.name(), response.stage);
         assertTrue(response.reply.toLowerCase().contains("tudo certo"));
+    }
+
+    @Test
+    void deveSinalizarLeadDeAgendamentoMesmoQuandoAindaEstiverPedindoNome() {
+        ConversationData data = new ConversationData();
+        data.stage = ConversationStage.START;
+
+        mockCurrentState(data);
+
+        ServicoDto corte = new ServicoDto();
+        corte.id = UUID.randomUUID().toString();
+        corte.name = "Corte";
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.BOOK, 0.95d));
+        when(serviceNameFinder.extractFirst(anyString())).thenReturn(Optional.of("corte"));
+        when(domainService.resolveService(anyString(), eq("corte"))).thenReturn(Optional.of(corte));
+        when(domainService.canScheduleViaWhatsApp(anyString())).thenReturn(true);
+        when(domainService.resolveRegisteredCustomerName(anyString(), anyString())).thenReturn(Optional.empty());
+
+        AssistantMessageResponse response = service.process(
+                "quero agendar para hoje um corte de cabelo",
+                USER_ID,
+                null);
+
+        assertEquals(ConversationStage.ASK_NAME.name(), response.stage);
+        assertEquals(Boolean.TRUE, response.slots.get("bookingLeadDetected"));
+        assertEquals(corte.id, response.slots.get("bookingLeadServiceId"));
+        assertEquals("Corte", response.slots.get("bookingLeadServiceName"));
+        assertEquals(LocalDate.now().toString(), response.slots.get("bookingLeadDate"));
     }
 
     private void mockCurrentState(ConversationData data) {

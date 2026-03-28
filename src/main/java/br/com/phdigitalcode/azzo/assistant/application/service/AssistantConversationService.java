@@ -137,6 +137,12 @@ public class AssistantConversationService {
     response.slots.put("availableTimeOptions", data.availableTimeOptions);
     response.slots.put("appointmentId", data.appointmentId);
     response.slots.put("sourceAppointmentId", data.sourceAppointmentId);
+    BookingLeadSignals bookingLead = detectBookingLeadSignals(rawMessage, data, tenantIdStr);
+    response.slots.put("bookingLeadDetected", bookingLead.detected);
+    response.slots.put("bookingLeadServiceId", bookingLead.serviceId);
+    response.slots.put("bookingLeadServiceName", bookingLead.serviceName);
+    response.slots.put("bookingLeadDate", bookingLead.date);
+    response.slots.put("bookingLeadTime", bookingLead.time);
     return response;
   }
 
@@ -1061,6 +1067,9 @@ public class AssistantConversationService {
     if (normalized.isBlank()) return null;
     if (DateTimeRegexExtractor.isAffirmative(normalized) || DateTimeRegexExtractor.isNegative(normalized)) return null;
     if (normalized.matches("^\\d+$")) return null;
+    if (mentionsBookingIntent(normalized)) return null;
+    if (DateTimeRegexExtractor.extractDate(normalized).isPresent()) return null;
+    if (DateTimeRegexExtractor.extractTime(normalized).isPresent()) return null;
 
     return trimmed;
   }
@@ -1660,6 +1669,69 @@ public class AssistantConversationService {
     if (rawMessage == null || rawMessage.isBlank()) return false;
     String normalized = TextNormalizer.normalize(rawMessage);
     return isInformalAffirmative(normalized) || DateTimeRegexExtractor.isAffirmative(normalized);
+  }
+
+  private BookingLeadSignals detectBookingLeadSignals(String rawMessage, ConversationData data, String tenantId) {
+    BookingLeadSignals signals = new BookingLeadSignals();
+    if (rawMessage == null || rawMessage.isBlank()) return signals;
+
+    String normalized = TextNormalizer.normalize(rawMessage);
+    boolean bookingIntent = mentionsBookingIntent(normalized) || isBookIntent(rawMessage);
+
+    if (data.serviceId != null || (data.serviceName != null && !data.serviceName.isBlank())) {
+      signals.serviceId = data.serviceId != null ? data.serviceId.toString() : null;
+      signals.serviceName = data.serviceName;
+    } else {
+      Optional<ServicoDto> resolvedService;
+      Optional<String> extractedName = serviceNameFinder.extractFirst(rawMessage);
+      resolvedService = extractedName.flatMap(name -> domainService.resolveService(tenantId, name));
+      if (resolvedService.isEmpty()) {
+        resolvedService = domainService.resolveService(tenantId, rawMessage);
+      }
+      if (resolvedService.isPresent()) {
+        signals.serviceId = resolvedService.get().id;
+        signals.serviceName = resolvedService.get().name;
+      }
+    }
+
+    LocalDate resolvedDate = data.date != null ? data.date : DateTimeRegexExtractor.extractDate(rawMessage).orElse(null);
+    String resolvedTime = data.time != null && !data.time.isBlank()
+        ? data.time
+        : DateTimeRegexExtractor.extractTime(rawMessage).map(this::normalizeTime).orElse(null);
+
+    signals.date = resolvedDate != null ? resolvedDate.toString() : null;
+    signals.time = resolvedTime;
+    signals.detected = bookingIntent && (signals.serviceId != null || signals.serviceName != null || signals.date != null || signals.time != null);
+    return signals;
+  }
+
+  private boolean mentionsBookingIntent(String normalized) {
+    if (normalized == null || normalized.isBlank()) return false;
+    return normalized.contains("agendar")
+        || normalized.contains("marcar")
+        || normalized.contains("horario")
+        || normalized.contains("agenda")
+        || normalized.contains("quero atendimento")
+        || normalized.contains("quero um horario");
+  }
+
+  private boolean isBookIntent(String rawMessage) {
+    try {
+      IntentPrediction prediction = intentClassifier.classifyWithConfidence(rawMessage);
+      return prediction != null
+          && prediction.intent == IntentType.BOOK
+          && prediction.confidence >= minIntentConfidence;
+    } catch (Exception ignored) {
+      return false;
+    }
+  }
+
+  private static final class BookingLeadSignals {
+    private boolean detected;
+    private String serviceId;
+    private String serviceName;
+    private String date;
+    private String time;
   }
 
   private boolean hasWord(String text, String word) {
