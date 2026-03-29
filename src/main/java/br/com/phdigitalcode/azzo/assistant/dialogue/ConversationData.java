@@ -24,6 +24,9 @@ public class ConversationData {
   public String userIdentifier;
   public ConversationStage reactivationResumeStage;
   public String reactivationLastPrompt;
+  public boolean manualInterventionSuggested;
+  public String manualInterventionReason;
+  public Integer manualInterventionAttempts;
   public TimePeriod preferredPeriod;
   public List<String> professionalOptionIds = new ArrayList<>();
   public List<String> professionalOptionNames = new ArrayList<>();
@@ -57,6 +60,9 @@ public class ConversationData {
     customerName = null;
     reactivationResumeStage = null;
     reactivationLastPrompt = null;
+    manualInterventionSuggested = false;
+    manualInterventionReason = null;
+    manualInterventionAttempts = null;
     preferredPeriod = null;
     professionalOptionIds.clear();
     professionalOptionNames.clear();

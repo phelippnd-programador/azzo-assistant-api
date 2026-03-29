@@ -104,6 +104,7 @@ public class AssistantConversationService {
     ConversationData data = stateManager.parseState(entity.stateJson);
     // Mantém userIdentifier sempre atualizado no estado (usado nas notificações)
     data.userIdentifier = userIdentifier;
+    clearManualInterventionSignal(data);
     if ((data.customerName == null || data.customerName.isBlank()) && userName != null) {
       data.customerName = userName;
     }
@@ -143,6 +144,9 @@ public class AssistantConversationService {
     response.slots.put("bookingLeadServiceName", bookingLead.serviceName);
     response.slots.put("bookingLeadDate", bookingLead.date);
     response.slots.put("bookingLeadTime", bookingLead.time);
+    response.slots.put("manualInterventionSuggested", data.manualInterventionSuggested);
+    response.slots.put("manualInterventionReason", data.manualInterventionReason);
+    response.slots.put("manualInterventionAttempts", data.manualInterventionAttempts);
     return response;
   }
 
@@ -955,11 +959,26 @@ public class AssistantConversationService {
    */
   private String withHandoffIfNeeded(ConversationData data, String base) {
     if (data.stageAttempts >= 3) {
+      markManualIntervention(data, "STAGE_RETRY_LIMIT");
       String suggestion = ollamaResponseService.generateHandoffSuggestion()
           .orElse("Estou com dificuldade de entender 😅 Quer falar com uma atendente? Responde SIM! 👩");
       return base + "\n\n" + suggestion;
     }
     return base;
+  }
+
+  private void clearManualInterventionSignal(ConversationData data) {
+    if (data == null) return;
+    data.manualInterventionSuggested = false;
+    data.manualInterventionReason = null;
+    data.manualInterventionAttempts = null;
+  }
+
+  private void markManualIntervention(ConversationData data, String reason) {
+    if (data == null) return;
+    data.manualInterventionSuggested = true;
+    data.manualInterventionReason = reason;
+    data.manualInterventionAttempts = data.stageAttempts;
   }
 
   private String buildProfessionalPrompt(ConversationData data, String tenantId) {

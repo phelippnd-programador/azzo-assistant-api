@@ -31,6 +31,7 @@ import br.com.phdigitalcode.azzo.assistant.extractor.ProfessionalNameFinder;
 import br.com.phdigitalcode.azzo.assistant.extractor.ServiceNameFinder;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ServicoDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.tenant.ContextoTenant;
+import br.com.phdigitalcode.azzo.assistant.llm.OllamaResponseService;
 import br.com.phdigitalcode.azzo.assistant.model.AssistantMessageResponse;
 import br.com.phdigitalcode.azzo.assistant.model.IntentPrediction;
 import br.com.phdigitalcode.azzo.assistant.model.IntentType;
@@ -42,6 +43,7 @@ class AssistantConversationReactivationUnitTest {
     @Mock OpenNLPIntentClassifier intentClassifier;
     @Mock ServiceNameFinder serviceNameFinder;
     @Mock ProfessionalNameFinder professionalNameFinder;
+    @Mock OllamaResponseService ollamaResponseService;
     @Mock AssistantDomainService domainService;
     @Mock ConversationStateManager stateManager;
     @Mock ContextoTenant contextoTenant;
@@ -63,6 +65,8 @@ class AssistantConversationReactivationUnitTest {
         lenient().doNothing().when(stateManager).save(any(ConversationStateEntity.class), anyString());
         lenient().doNothing().when(stateManager).delete(any(ConversationStateEntity.class));
         when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
+        lenient().when(ollamaResponseService.generateHandoffSuggestion())
+                .thenReturn(Optional.of("Quer falar com uma atendente?"));
     }
 
     @Test
@@ -130,6 +134,30 @@ class AssistantConversationReactivationUnitTest {
         assertEquals(corte.id, response.slots.get("bookingLeadServiceId"));
         assertEquals("Corte", response.slots.get("bookingLeadServiceName"));
         assertEquals(LocalDate.now().toString(), response.slots.get("bookingLeadDate"));
+    }
+
+    @Test
+    void deveSinalizarIntervencaoManualQuandoFluxoTravarNoMesmoEstagio() {
+        ConversationData data = new ConversationData();
+        data.stage = ConversationStage.ASK_SERVICE;
+        data.stageAttempts = 3;
+        data.customerName = USER_NAME;
+
+        mockCurrentState(data);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.BOOK, 0.95d));
+        when(serviceNameFinder.extractFirst(anyString())).thenReturn(Optional.empty());
+        when(domainService.resolveService(anyString(), anyString())).thenReturn(Optional.empty());
+        when(domainService.formatServicesPromptForCustomer(anyString(), anyString()))
+                .thenReturn("Me diga qual servico voce quer agendar.");
+
+        AssistantMessageResponse response = service.process("nao sei", USER_ID, USER_NAME);
+
+        assertEquals(Boolean.TRUE, response.slots.get("manualInterventionSuggested"));
+        assertEquals("STAGE_RETRY_LIMIT", response.slots.get("manualInterventionReason"));
+        assertEquals(4, response.slots.get("manualInterventionAttempts"));
+        assertTrue(response.reply.toLowerCase().contains("atendente"));
     }
 
     private void mockCurrentState(ConversationData data) {
