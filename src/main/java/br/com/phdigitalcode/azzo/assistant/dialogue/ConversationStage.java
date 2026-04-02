@@ -11,5 +11,12 @@ public enum ConversationStage {
   ASK_PERIOD,
   ASK_TIME,
   CONFIRMATION,
-  COMPLETED
+  COMPLETED,
+  /**
+   * Contexto pré-semeado pelo ReminderScheduler ao enviar o lembrete automático.
+   * O assistente aguarda o cliente responder CONFIRMAR ou CANCELAR para um
+   * agendamento já existente — sem iniciar um novo fluxo de booking.
+   */
+  AWAITING_APPOINTMENT_CONFIRMATION,
+  AWAITING_REACTIVATION_REPLY
 }

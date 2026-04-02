@@ -27,6 +27,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
+import br.com.phdigitalcode.azzo.assistant.llm.OllamaResponseService;
 
 @ApplicationScoped
 public class AssistantDomainService {
@@ -43,6 +44,9 @@ public class AssistantDomainService {
   @Inject
   @RestClient
   AgendaProInternalClient agendaProClient;
+
+  @Inject
+  OllamaResponseService ollamaResponseService;
 
   // ─── Serviços ─────────────────────────────────────────────────────────────
 
@@ -66,12 +70,39 @@ public class AssistantDomainService {
   }
 
   public String formatServicesPrompt(String tenantId) {
+    return formatServicesPromptForCustomer(tenantId, null);
+  }
+
+  public String formatServicesPromptForCustomer(String tenantId, String customerName) {
     List<ServicoDto> services = listServices(tenantId);
     if (services.isEmpty()) {
       return "Hmm, não tem serviços disponíveis agora. 😕";
     }
-    String list = services.stream().map(s -> s.name).limit(10).collect(Collectors.joining("\n- ", "\n- ", ""));
-    return "Qual serviço você quer? 💅" + list;
+    // Tenta gerar resposta humanizada via LLM
+    Optional<String> llmReply = ollamaResponseService.generateServicesMessage(customerName, services);
+    if (llmReply.isPresent()) {
+      return llmReply.get();
+    }
+    // Fallback enriquecido: mostra preço, duração e descrição quando disponíveis
+    StringBuilder sb = new StringBuilder("Qual serviço você quer? 💅\n");
+    int idx = 1;
+    for (ServicoDto s : services.stream().limit(10).toList()) {
+      sb.append("\n").append(idx++).append(" - ").append(s.name);
+      if (s.price > 0) sb.append(" — R$").append(String.format(Locale.ROOT, "%.0f", s.price));
+      if (s.duration > 0) sb.append(" | ").append(formatDurationMinutes(s.duration));
+      if (s.description != null && !s.description.isBlank()) {
+        sb.append("\n   ").append(s.description.trim());
+      }
+    }
+    sb.append("\n\nManda o número ou o nome do serviço! 😊");
+    return sb.toString();
+  }
+
+  private String formatDurationMinutes(int minutes) {
+    if (minutes < 60) return minutes + "min";
+    int h = minutes / 60;
+    int m = minutes % 60;
+    return m == 0 ? h + "h" : h + "h" + m + "min";
   }
 
   // ─── Profissionais ────────────────────────────────────────────────────────
@@ -97,10 +128,34 @@ public class AssistantDomainService {
 
     return listProfessionalsByService(tenantId, serviceId).stream()
         .sorted((left, right) -> Integer.compare(
-            scoreMatch(TextNormalizer.normalize(right.name), normalized),
-            scoreMatch(TextNormalizer.normalize(left.name), normalized)))
-        .filter(p -> scoreMatch(TextNormalizer.normalize(p.name), normalized) > 0)
+            scoreMatchProfessional(right, normalized),
+            scoreMatchProfessional(left, normalized)))
+        .filter(p -> scoreMatchProfessional(p, normalized) > 0)
         .findFirst();
+  }
+
+  /**
+   * Pontua o match de um profissional contra o texto candidato.
+   * Considera tanto o nome do profissional quanto o nome das suas especialidades,
+   * retornando o maior score entre eles.
+   */
+  private int scoreMatchProfessional(ProfissionalDto p, String normalized) {
+    int nameScore = scoreMatch(TextNormalizer.normalize(p.name), normalized);
+    if (p.specialtiesDetailed == null || p.specialtiesDetailed.isEmpty()) return nameScore;
+    int specialtyScore = p.specialtiesDetailed.stream()
+        .mapToInt(s -> scoreMatch(TextNormalizer.normalize(s.name), normalized))
+        .max()
+        .orElse(0);
+    return Math.max(nameScore, specialtyScore);
+  }
+
+  /**
+   * Retorna o nome da primeira especialidade do profissional, ou {@code null} se não houver.
+   * Usado para enriquecer a mensagem de confirmação de agendamento.
+   */
+  public String firstSpecialtyName(ProfissionalDto p) {
+    if (p == null || p.specialtiesDetailed == null || p.specialtiesDetailed.isEmpty()) return null;
+    return p.specialtiesDetailed.get(0).name;
   }
 
   // ─── Slots disponíveis ────────────────────────────────────────────────────
@@ -112,6 +167,7 @@ public class AssistantDomainService {
           tenantId,
           professionalId.toString(),
           date.toString(),
+          serviceId != null ? serviceId.toString() : null,
           duration,
           0);
       // Normaliza ambos os lados para "HH:mm" — API pode retornar "HH:mm:ss"
@@ -133,6 +189,7 @@ public class AssistantDomainService {
           tenantId,
           professionalId.toString(),
           date.toString(),
+          serviceId != null ? serviceId.toString() : null,
           duration,
           0);
       return slots.stream()
@@ -198,13 +255,18 @@ public class AssistantDomainService {
     ClienteDto client = resolveOrCreateClient(tenantId, userIdentifier, customerName);
 
     AgendamentoCreateDto req = new AgendamentoCreateDto();
-    req.serviceId = serviceId.toString();
     req.professionalId = professionalId.toString();
     req.clientId = client.id;
     req.date = date.toString();
     req.startTime = time;
     req.status = STATUS_PENDING;
     req.notes = "Criado pelo assistant";
+    AgendamentoCreateDto.ItemDto item = new AgendamentoCreateDto.ItemDto();
+    item.serviceId = serviceId.toString();
+    item.quantity = 1;
+    item.unitPrice = 0;
+    item.totalPrice = 0;
+    req.items.add(item);
 
     AgendamentoDto created = agendaProClient.criarAgendamento(tenantId, req);
     return UUID.fromString(created.id);

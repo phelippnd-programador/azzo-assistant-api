@@ -53,6 +53,9 @@ class AssistantConversationServiceTest {
     ConversationStateRepository stateRepository;
 
     @Mock
+    ConversationStateManager stateManager;
+
+    @Mock
     ContextoTenant contextoTenant;
 
     @Spy
@@ -80,6 +83,9 @@ class AssistantConversationServiceTest {
         setPrivateField("ttlMinutes", 120L);
         setPrivateField("greetingZone", "America/Sao_Paulo");
         setPrivateField("minIntentConfidence", 0.62d);
+        lenient().when(stateManager.toJson(any(ConversationData.class))).thenReturn("{}");
+        lenient().doNothing().when(stateManager).save(any(ConversationStateEntity.class), anyString());
+        lenient().doNothing().when(stateManager).delete(any(ConversationStateEntity.class));
     }
 
     private void setPrivateField(String fieldName, Object value) throws Exception {
@@ -104,7 +110,7 @@ class AssistantConversationServiceTest {
     /** Configura stateRepository para novo usuário (sem estado persistido). */
     private void setupNovoUsuario() {
         when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
-        doNothing().when(stateRepository).deleteExpired(any());
+        when(stateRepository.deleteExpired(any())).thenReturn(0L);
         when(stateRepository.findActive(eq(tenantId), eq(USER_ID), any()))
                 .thenReturn(Optional.empty());
 //        doNothing().when(stateRepository).persist(any());
@@ -113,7 +119,7 @@ class AssistantConversationServiceTest {
     /** Configura stateRepository para usuário com estado pré-existente. */
     private void setupUsuarioComEstado(ConversationData data) throws Exception {
         when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
-        doNothing().when(stateRepository).deleteExpired(any());
+        when(stateRepository.deleteExpired(any())).thenReturn(0L);
         when(stateRepository.findActive(eq(tenantId), eq(USER_ID), any()))
                 .thenReturn(Optional.of(entityComEstado(data)));
 //        doNothing().when(stateRepository).persist(any());
@@ -316,7 +322,7 @@ class AssistantConversationServiceTest {
     @DisplayName("process: JSON corrompido no estado → reinicia conversa sem erro")
     void process_jsonCorrompido_reiniciaConversa() throws Exception {
         when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
-        doNothing().when(stateRepository).deleteExpired(any());
+        when(stateRepository.deleteExpired(any())).thenReturn(0L);
 
         // Entidade com JSON inválido
         ConversationStateEntity entityCorrompida = new ConversationStateEntity();
@@ -426,5 +432,47 @@ class AssistantConversationServiceTest {
         assertNotNull(response.reply);
         assertTrue(response.reply.toLowerCase().contains("agendamentos"),
                 "Deve listar agendamentos. Reply: " + response.reply);
+    }
+
+    @Test
+    @DisplayName("process: resposta afirmativa em reativacao retoma do ponto salvo")
+    void process_respostaAfirmativaEmReativacao_retomaFluxo() throws Exception {
+        ConversationData estadoReativacao = new ConversationData();
+        estadoReativacao.stage = ConversationStage.AWAITING_REACTIVATION_REPLY;
+        estadoReativacao.customerName = USER_NAME;
+        estadoReativacao.userIdentifier = USER_ID;
+        estadoReativacao.reactivationResumeStage = ConversationStage.ASK_SERVICE;
+
+        setupUsuarioComEstado(estadoReativacao);
+        when(domainService.formatServicesPrompt(any()))
+                .thenReturn("Me diga qual servico voce quer agendar.");
+
+        AssistantMessageResponse response = service.process("sim", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        assertEquals(ConversationStage.ASK_SERVICE.name(), response.stage);
+        assertTrue(response.reply.toLowerCase().contains("retomar"),
+                "Deve indicar retomada do fluxo. Reply: " + response.reply);
+        assertTrue(response.reply.toLowerCase().contains("servico"),
+                "Deve voltar ao passo salvo. Reply: " + response.reply);
+    }
+
+    @Test
+    @DisplayName("process: resposta negativa em reativacao encerra o contexto")
+    void process_respostaNegativaEmReativacao_descartaContexto() throws Exception {
+        ConversationData estadoReativacao = new ConversationData();
+        estadoReativacao.stage = ConversationStage.AWAITING_REACTIVATION_REPLY;
+        estadoReativacao.customerName = USER_NAME;
+        estadoReativacao.userIdentifier = USER_ID;
+        estadoReativacao.reactivationResumeStage = ConversationStage.ASK_TIME;
+
+        setupUsuarioComEstado(estadoReativacao);
+
+        AssistantMessageResponse response = service.process("nao quero", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        assertEquals(ConversationStage.START.name(), response.stage);
+        assertTrue(response.reply.toLowerCase().contains("tudo certo"),
+                "Deve encerrar o contexto de reativacao. Reply: " + response.reply);
     }
 }
