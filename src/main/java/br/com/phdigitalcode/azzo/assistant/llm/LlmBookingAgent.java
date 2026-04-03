@@ -49,13 +49,24 @@ public class LlmBookingAgent {
      */
     public AgentResult chat(String systemPrompt, List<ChatMessage> history,
             String userMessage, String activeProvider) {
+        return chat(systemPrompt, history, userMessage, activeProvider, AgentChatOptions.defaultOptions());
+    }
+
+    public AgentResult chat(String systemPrompt, List<ChatMessage> history,
+            String userMessage, String activeProvider, AgentChatOptions options) {
 
         long start = System.currentTimeMillis();
         try {
             LlmRouter.Provider provider = llmRouter.select(activeProvider);
-            List<OllamaMessage> messages = buildMessages(systemPrompt, history, userMessage);
+            AgentChatOptions effectiveOptions = options == null ? AgentChatOptions.defaultOptions() : options;
+            String effectiveSystemPrompt = applyRuntimeInstruction(systemPrompt, effectiveOptions.runtimeInstruction());
+            List<OllamaMessage> messages = buildMessages(effectiveSystemPrompt, history, userMessage);
 
-            LlmRouter.LlmResponse response = llmRouter.call(provider, systemPrompt, messages);
+            LlmRouter.LlmResponse response = llmRouter.call(
+                    provider,
+                    effectiveSystemPrompt,
+                    messages,
+                    effectiveOptions.maxTokens());
             long elapsed = System.currentTimeMillis() - start;
 
             if (response.isError()) {
@@ -123,6 +134,13 @@ public class LlmBookingAgent {
         return messages;
     }
 
+    private String applyRuntimeInstruction(String systemPrompt, String runtimeInstruction) {
+        if (runtimeInstruction == null || runtimeInstruction.isBlank()) {
+            return systemPrompt;
+        }
+        return systemPrompt + "\n\n" + runtimeInstruction.trim();
+    }
+
     // ─── Tipos públicos ───────────────────────────────────────────────────────
 
     public record AgentResult(String text, List<AgentAction> actions, String providerUsed) {
@@ -143,6 +161,12 @@ public class LlmBookingAgent {
     public record AgentAction(String type, Map<String, String> params) {
         public String param(String key) {
             return params.getOrDefault(key, null);
+        }
+    }
+
+    public record AgentChatOptions(Integer maxTokens, String runtimeInstruction) {
+        public static AgentChatOptions defaultOptions() {
+            return new AgentChatOptions(null, null);
         }
     }
 }

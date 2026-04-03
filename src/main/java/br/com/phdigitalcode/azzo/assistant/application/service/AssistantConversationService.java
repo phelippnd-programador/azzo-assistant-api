@@ -81,6 +81,10 @@ public class AssistantConversationService {
   double ollamaMinConfidence;
   @ConfigProperty(name = "assistant.agent.enabled", defaultValue = "false")
   boolean agentEnabled;
+  @ConfigProperty(name = "assistant.llm.max-input-chars", defaultValue = "600")
+  int llmMaxInputChars;
+  @ConfigProperty(name = "assistant.llm.short-response-max-tokens", defaultValue = "48")
+  int shortResponseMaxTokens;
 
   // Sem @Transactional aqui — chamadas ao LLM (lentas) não podem segurar uma transação JTA aberta.
   // As operações de DB são delegadas ao ConversationStateManager que abre transações curtas.
@@ -191,11 +195,13 @@ public class AssistantConversationService {
     // Resolve datas relativas em Java antes de enviar ao LLM (modelos 8B erram esse cálculo)
     String contextualMessage = contextualizeAgentSelection(data, rawMessage, normalized);
     String enrichedMessage = enrichDatesInMessage(contextualMessage);
+    String compactedMessage = compactMessageForLlm(enrichedMessage);
+    LlmBookingAgent.AgentChatOptions chatOptions = buildAgentChatOptions(data, rawMessage);
 
     String systemPrompt = agentSystemPromptBuilder.build(tenantId);
     // Passa activeProvider para sticky routing — null = nova conversa, router decide
     LlmBookingAgent.AgentResult result = llmBookingAgent.chat(
-        systemPrompt, data.chatHistory, enrichedMessage, data.activeProvider);
+        systemPrompt, data.chatHistory, compactedMessage, data.activeProvider, chatOptions);
 
     // Persiste o provider escolhido para manter sticky durante toda a conversa
     if (result.providerUsed() != null) {
@@ -209,7 +215,7 @@ public class AssistantConversationService {
         && isAffirmativeResponse(rawMessage)) {
       LOG.infof("[Agent] Confirmação detectada sem action token — re-chamando LLM com hint");
       List<ChatMessage> tempHistory = new ArrayList<>(data.chatHistory);
-      tempHistory.add(new ChatMessage("user", enrichedMessage));
+      tempHistory.add(new ChatMessage("user", compactedMessage));
       tempHistory.add(new ChatMessage("tool",
           "[Sistema: o cliente acabou de confirmar o agendamento. "
           + "Emita OBRIGATORIAMENTE [CRIAR_AGENDAMENTO:...] com todos os dados coletados na conversa. "
@@ -228,7 +234,7 @@ public class AssistantConversationService {
     String finalReply = processActions(result, data, userIdentifier, tenantId, systemPrompt);
 
     // Grava no histórico para próximos turnos (usa mensagem enriquecida para consistência)
-    data.chatHistory.add(new ChatMessage("user", enrichedMessage));
+    data.chatHistory.add(new ChatMessage("user", compactedMessage));
     data.chatHistory.add(new ChatMessage("assistant", finalReply));
 
     return finalReply;
@@ -1747,6 +1753,73 @@ public class AssistantConversationService {
     if (rawMessage == null || rawMessage.isBlank()) return false;
     String normalized = TextNormalizer.normalize(rawMessage);
     return isInformalAffirmative(normalized) || DateTimeRegexExtractor.isAffirmative(normalized);
+  }
+
+  String compactMessageForLlm(String message) {
+    if (message == null || message.isBlank()) return message;
+
+    String normalized = message
+        .replace("\r\n", "\n")
+        .replaceAll("[ \\t]{2,}", " ")
+        .replaceAll("\\n{3,}", "\n\n")
+        .trim();
+
+    int maxChars = Math.max(llmMaxInputChars, 200);
+    if (normalized.length() <= maxChars) {
+      return normalized;
+    }
+
+    String notice = "\n[Mensagem longa truncada pelo sistema. Foque no pedido principal visivel.]\n";
+    int remaining = maxChars - notice.length();
+    if (remaining <= 120) {
+      return normalized.substring(0, Math.min(normalized.length(), maxChars));
+    }
+
+    int head = Math.max(remaining * 2 / 3, 120);
+    int tail = Math.max(remaining - head, 80);
+    head = Math.min(head, normalized.length());
+    tail = Math.min(tail, normalized.length() - head);
+
+    String compacted = normalized.substring(0, head).trim()
+        + notice
+        + normalized.substring(normalized.length() - tail).trim();
+    LOG.infof("[Agent] Mensagem compactada para o LLM: original=%d chars compactada=%d chars",
+        normalized.length(),
+        compacted.length());
+    return compacted;
+  }
+
+  LlmBookingAgent.AgentChatOptions buildAgentChatOptions(ConversationData data, String rawMessage) {
+    if (!shouldUseShortReplyMode(data, rawMessage)) {
+      return LlmBookingAgent.AgentChatOptions.defaultOptions();
+    }
+
+    return new LlmBookingAgent.AgentChatOptions(
+        Math.max(shortResponseMaxTokens, 24),
+        """
+        RESPOSTA CURTA:
+        - Se a pergunta for simples, responda em no maximo 1 frase curta.
+        - Seja direta e objetiva.
+        - Nao use listas nem explicacoes longas.
+        - Nao emita action tokens desnecessarios.
+        """);
+  }
+
+  boolean shouldUseShortReplyMode(ConversationData data, String rawMessage) {
+    if (rawMessage == null || rawMessage.isBlank()) return false;
+    if (data == null) return false;
+    if (data.stage != ConversationStage.START && data.stage != ConversationStage.COMPLETED) {
+      return false;
+    }
+
+    try {
+      IntentPrediction prediction = intentClassifier.classifyWithConfidence(rawMessage);
+      if (prediction == null) return false;
+      return prediction.intent == IntentType.GREETING || prediction.intent == IntentType.UNKNOWN;
+    } catch (Exception e) {
+      LOG.debugf("[Agent] Falha ao classificar pergunta padrao para resposta curta: %s", e.getMessage());
+      return false;
+    }
   }
 
   private BookingLeadSignals detectBookingLeadSignals(String rawMessage, ConversationData data, String tenantId) {
