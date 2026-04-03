@@ -178,6 +178,8 @@ public class AssistantConversationService {
       data.customerName = savedName; // mantém o nome para não precisar perguntar de novo
     }
 
+    String normalized = TextNormalizer.normalize(rawMessage);
+
     // Limita o histórico a 30 mensagens para não estourar o contexto do LLM
     if (data.chatHistory.size() > 30) {
       List<ChatMessage> kept = new ArrayList<>(data.chatHistory.subList(
@@ -187,7 +189,8 @@ public class AssistantConversationService {
     }
 
     // Resolve datas relativas em Java antes de enviar ao LLM (modelos 8B erram esse cálculo)
-    String enrichedMessage = enrichDatesInMessage(rawMessage);
+    String contextualMessage = contextualizeAgentSelection(data, rawMessage, normalized);
+    String enrichedMessage = enrichDatesInMessage(contextualMessage);
 
     String systemPrompt = agentSystemPromptBuilder.build(tenantId);
     // Passa activeProvider para sticky routing — null = nova conversa, router decide
@@ -229,6 +232,62 @@ public class AssistantConversationService {
     data.chatHistory.add(new ChatMessage("assistant", finalReply));
 
     return finalReply;
+  }
+
+  /**
+   * No modo agent, respostas curtas como "7" ou "2" precisam ser transformadas em
+   * contexto explícito antes de ir ao LLM. Sem isso, o modelo recebe apenas um ordinal
+   * solto e pode falhar em conectar a escolha à lista apresentada no turno anterior.
+   */
+  private String contextualizeAgentSelection(ConversationData data, String rawMessage, String normalized) {
+    if (rawMessage == null || rawMessage.isBlank()) {
+      return rawMessage;
+    }
+
+    if (!data.availableTimeOptions.isEmpty()) {
+      OptionalInt selectedTimeIndex = parseOrdinalSelection(rawMessage, data.availableTimeOptions.size());
+      if (selectedTimeIndex.isPresent()) {
+        String selectedTime = data.availableTimeOptions.get(selectedTimeIndex.getAsInt());
+        LOG.debugf("[Agent] Reescrevendo escolha ordinal de horário: input=%s horario=%s", rawMessage, selectedTime);
+        return rawMessage + "\n[Sistema: o cliente escolheu o horário " + selectedTime
+            + " da lista de opções já apresentada.]";
+      }
+
+      Optional<String> extractedTime = DateTimeRegexExtractor.extractTime(rawMessage);
+      if (extractedTime.isPresent()) {
+        String normalizedTime = normalizeTime(extractedTime.get());
+        if (data.availableTimeOptions.contains(normalizedTime)) {
+          LOG.debugf("[Agent] Reescrevendo escolha literal de horário: input=%s horario=%s", rawMessage, normalizedTime);
+          return rawMessage + "\n[Sistema: o cliente escolheu o horário " + normalizedTime
+              + " da lista de opções já apresentada.]";
+        }
+      }
+    }
+
+    if (data.professionalId == null && !data.professionalOptionNames.isEmpty()) {
+      OptionalInt selectedProfessionalIndex = parseOrdinalSelection(rawMessage, data.professionalOptionNames.size());
+      if (selectedProfessionalIndex.isPresent()) {
+        String selectedProfessional = data.professionalOptionNames.get(selectedProfessionalIndex.getAsInt());
+        LOG.debugf("[Agent] Reescrevendo escolha ordinal de profissional: input=%s profissional=%s",
+            rawMessage, selectedProfessional);
+        return rawMessage + "\n[Sistema: o cliente escolheu o profissional " + selectedProfessional
+            + " da lista de opções já apresentada.]";
+      }
+    }
+
+    if (!data.appointmentOptionLabels.isEmpty()) {
+      OptionalInt selectedAppointmentIndex = parseOrdinalSelection(rawMessage, data.appointmentOptionLabels.size());
+      if (selectedAppointmentIndex.isPresent()) {
+        String selectedAppointment = data.appointmentOptionLabels.get(selectedAppointmentIndex.getAsInt());
+        LOG.debugf("[Agent] Reescrevendo escolha ordinal de agendamento: input=%s agendamento=%s",
+            rawMessage, selectedAppointment);
+        return rawMessage + "\n[Sistema: o cliente escolheu a opção " + selectedAppointment
+            + " da lista de agendamentos já apresentada.]";
+      }
+    }
+
+    // Mantém a mensagem original quando não há escolha estruturada para contextualizar.
+    return rawMessage;
   }
 
   /**
