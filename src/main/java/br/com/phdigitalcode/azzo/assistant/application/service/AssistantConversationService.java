@@ -148,6 +148,7 @@ public class AssistantConversationService {
     response.slots.put("bookingLeadServiceName", bookingLead.serviceName);
     response.slots.put("bookingLeadDate", bookingLead.date);
     response.slots.put("bookingLeadTime", bookingLead.time);
+    response.slots.put("reactivationStage", deriveReactivationStage(data));
     response.slots.put("manualInterventionSuggested", data.manualInterventionSuggested);
     response.slots.put("manualInterventionReason", data.manualInterventionReason);
     response.slots.put("manualInterventionAttempts", data.manualInterventionAttempts);
@@ -160,6 +161,22 @@ public class AssistantConversationService {
    * Novo fluxo orientado a LLM: o modelo conduz toda a conversa com contexto
    * completo do salão. Java executa as ações detectadas nos action tokens.
    */
+  private String deriveReactivationStage(ConversationData data) {
+    if (data == null || data.stage == null) return null;
+
+    return switch (data.stage) {
+      case START, ASK_NAME, ASK_SERVICE -> "SERVICE_SELECTION";
+      case ASK_PROFESSIONAL -> "PROFESSIONAL_SELECTION";
+      case ASK_DATE, ASK_PERIOD, ASK_TIME -> "TIME_SELECTION";
+      case CONFIRMATION -> "FINAL_REVIEW";
+      case COMPLETED -> "COMPLETED";
+      case ASK_CANCEL_APPOINTMENT,
+          ASK_RESCHEDULE_APPOINTMENT,
+          AWAITING_APPOINTMENT_CONFIRMATION,
+          AWAITING_REACTIVATION_REPLY -> null;
+    };
+  }
+
   private String handleMessageAgent(ConversationData data, String rawMessage,
       String userIdentifier, String tenantId) {
 
