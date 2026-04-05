@@ -11,7 +11,9 @@ import static org.mockito.Mockito.when;
 
 import java.lang.reflect.Field;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -23,6 +25,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import br.com.phdigitalcode.azzo.assistant.classifier.OpenNLPIntentClassifier;
+import br.com.phdigitalcode.azzo.assistant.dialogue.ConversationStage;
 import br.com.phdigitalcode.azzo.assistant.dialogue.ConversationData;
 import br.com.phdigitalcode.azzo.assistant.domain.entity.ConversationStateEntity;
 import br.com.phdigitalcode.azzo.assistant.extractor.ProfessionalNameFinder;
@@ -58,6 +61,7 @@ class AssistantConversationServiceCostControlUnitTest {
     setPrivateField("ttlMinutes", 120L);
     setPrivateField("maxHistoryMessages", 80);
     setPrivateField("keepHistoryMessages", 60);
+    setPrivateField("maxHistoryChars", 3000);
     setPrivateField("llmMaxInputChars", 160);
     setPrivateField("shortResponseMaxTokens", 48);
 
@@ -134,6 +138,42 @@ class AssistantConversationServiceCostControlUnitTest {
     assertEquals("PROFESSIONAL_SELECTION", response.slots.get("reactivationStage"));
     assertTrue(contextualizedMessage.contains("[Sistema: dados operacionais"));
     assertTrue(contextualizedMessage.contains("horario=17:00"));
+  }
+
+  @Test
+  void deveConsultarHorariosSemFazerSegundaChamadaAoLlm() {
+    ConversationData data = new ConversationData();
+    data.stage = ConversationStage.ASK_TIME;
+    data.customerName = "Phelipp";
+    data.serviceId = UUID.randomUUID();
+    data.serviceName = "Corte feminino";
+    data.professionalId = UUID.randomUUID();
+    data.professionalName = "Ana";
+    data.date = LocalDate.now().plusDays(1);
+    when(stateManager.parseState("{}")).thenReturn(data);
+    when(agentSystemPromptBuilder.resolveProfessionalId(anyString(), anyString()))
+        .thenReturn(Optional.of(data.professionalId));
+    when(agentSystemPromptBuilder.resolveServiceId(anyString(), anyString()))
+        .thenReturn(Optional.of(data.serviceId));
+    when(domainService.suggestTimes(anyString(), any(), any(), any(), any()))
+        .thenReturn(List.of("09:00", "09:30"));
+    when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
+        .thenReturn(new LlmBookingAgent.AgentResult(
+            "Vou verificar os horarios.",
+            List.of(new LlmBookingAgent.AgentAction(
+                "CONSULTAR_HORARIOS",
+                java.util.Map.of(
+                    "prof", "P1",
+                    "svc", "S1",
+                    "date", data.date.toString()))),
+            "GROQ"));
+
+    AssistantMessageResponse response = service.process("quero ver horarios", USER_ID, "Phelipp");
+
+    assertNotNull(response);
+    assertTrue(response.reply.contains("1. 09:00"));
+    assertTrue(response.reply.contains("2. 09:30"));
+    verify(llmBookingAgent).chat(anyString(), anyList(), anyString(), any(), any());
   }
 
   private void setPrivateField(String fieldName, Object value) throws Exception {

@@ -81,7 +81,10 @@ public class LlmBookingAgent {
             String cleanText = stripActions(raw).trim();
             if (cleanText.isBlank()) cleanText = "Entendido! 😊";
 
-            return new AgentResult(cleanText, actions, provider.name());
+            return new AgentResult(
+                    cleanText,
+                    actions,
+                    response.provider() != null ? response.provider().name() : provider.name());
 
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - start;

@@ -6,6 +6,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.time.temporal.TemporalAdjusters;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -55,6 +56,7 @@ import org.jboss.logging.Logger;
 public class AssistantConversationService {
 
   private static final Logger LOG = Logger.getLogger(AssistantConversationService.class);
+  private static final DateTimeFormatter DATE_BR_FORMATTER = DateTimeFormatter.ofPattern("dd/MM/yyyy");
 
   @Inject OpenNLPIntentClassifier intentClassifier;
   @Inject OllamaIntentService ollamaIntentService;
@@ -77,6 +79,8 @@ public class AssistantConversationService {
   int maxHistoryMessages;
   @ConfigProperty(name = "assistant.conversation.keep-history-messages", defaultValue = "60")
   int keepHistoryMessages;
+  @ConfigProperty(name = "assistant.conversation.max-history-chars", defaultValue = "3000")
+  int maxHistoryChars;
   @ConfigProperty(name = "assistant.greeting-zone", defaultValue = "America/Sao_Paulo")
   String greetingZone;
   @ConfigProperty(name = "assistant.intent.min-confidence", defaultValue = "0.62")
@@ -328,34 +332,18 @@ public class AssistantConversationService {
       return result.text();
     }
 
-    // CONSULTAR_HORARIOS — busca horários e re-chama LLM com o resultado
     LlmBookingAgent.AgentAction slotsAction = result.firstAction("CONSULTAR_HORARIOS");
     if (slotsAction != null) {
       String toolResult = executeConsultarHorarios(slotsAction, data, tenantId);
-      // Injeta o resultado como contexto e pede ao LLM para apresentar ao cliente
-      String toolContext = "[Sistema] Horários disponíveis:\n" + toolResult
-          + "\nApresente esses horários ao cliente e peça para escolher pelo número ou digitando o horário.";
-      List<ChatMessage> tempHistory = new ArrayList<>(data.chatHistory);
-      tempHistory.add(new ChatMessage("assistant", result.text()));
-      LlmBookingAgent.AgentResult followUp = llmBookingAgent.chat(
-          systemPrompt, tempHistory, toolContext, data.activeProvider);
-      return followUp.text().isBlank() ? result.text() : followUp.text();
+      return buildDeterministicAvailableSlotsReply(data, toolResult, result.text());
     }
 
-    // CRIAR_AGENDAMENTO — cria o agendamento e re-chama LLM com confirmação
     LlmBookingAgent.AgentAction bookAction = result.firstAction("CRIAR_AGENDAMENTO");
     if (bookAction != null) {
       String toolResult = executeCriarAgendamento(bookAction, data, userIdentifier, tenantId);
-      List<ChatMessage> tempHistory = new ArrayList<>(data.chatHistory);
-      tempHistory.add(new ChatMessage("assistant", result.text()));
-      tempHistory.add(new ChatMessage("user", "[Sistema] " + toolResult
-          + "\nConfirme o agendamento ao cliente com um resumo amigável."));
-      LlmBookingAgent.AgentResult followUp = llmBookingAgent.chat(
-          systemPrompt, tempHistory, "", data.activeProvider);
-      return followUp.text().isBlank() ? toolResult : followUp.text();
+      return buildDeterministicBookingConfirmationReply(data, toolResult);
     }
 
-    // CANCELAR_AGENDAMENTO
     LlmBookingAgent.AgentAction cancelAction = result.firstAction("CANCELAR_AGENDAMENTO");
     if (cancelAction != null) {
       return executeCancelarAgendamento(cancelAction, data, userIdentifier, tenantId);
@@ -402,6 +390,48 @@ public class AssistantConversationService {
       LOG.warnf("[Agent] Erro ao consultar horários: %s", e.getMessage());
       return "Erro ao consultar horários. Tente outra data.";
     }
+  }
+
+  private String buildDeterministicAvailableSlotsReply(
+      ConversationData data,
+      String toolResult,
+      String fallbackReply) {
+    if (toolResult == null || toolResult.isBlank()) {
+      return fallbackReply;
+    }
+
+    String normalizedToolResult = TextNormalizer.normalize(toolResult);
+    if (normalizedToolResult.contains("nao consegui")
+        || normalizedToolResult.contains("erro ao consultar")
+        || normalizedToolResult.contains("sem horarios disponiveis")) {
+      return toolResult;
+    }
+
+    if (data == null || data.availableTimeOptions == null || data.availableTimeOptions.isEmpty()) {
+      return toolResult;
+    }
+
+    StringBuilder reply = new StringBuilder("Encontrei estes horarios");
+    List<String> details = new ArrayList<>();
+    if (data.serviceName != null && !data.serviceName.isBlank()) {
+      details.add("para " + data.serviceName);
+    }
+    if (data.professionalName != null && !data.professionalName.isBlank()) {
+      details.add("com " + data.professionalName);
+    }
+    if (data.date != null) {
+      details.add("em " + formatDateBr(data.date));
+    }
+    if (!details.isEmpty()) {
+      reply.append(" ").append(String.join(" ", details));
+    }
+    reply.append(":\n");
+
+    for (int i = 0; i < data.availableTimeOptions.size(); i++) {
+      reply.append(i + 1).append(". ").append(data.availableTimeOptions.get(i)).append("\n");
+    }
+    reply.append("Pode escolher pelo numero ou digitando o horario que voce prefere.");
+    return reply.toString().trim();
   }
 
   private String executeCriarAgendamento(LlmBookingAgent.AgentAction action,
@@ -451,6 +481,48 @@ public class AssistantConversationService {
       LOG.warnf("[Agent] Erro ao criar agendamento: %s", e.getMessage());
       return "Não consegui criar o agendamento. Verifique se o horário ainda está disponível.";
     }
+  }
+
+  private String buildDeterministicBookingConfirmationReply(ConversationData data, String toolResult) {
+    if (toolResult == null || toolResult.isBlank()) {
+      return "Agendamento criado com sucesso!";
+    }
+
+    if (!toolResult.startsWith("Agendamento criado com sucesso!")) {
+      return toolResult;
+    }
+
+    StringBuilder reply = new StringBuilder("Agendamento confirmado");
+    List<String> summary = new ArrayList<>();
+    if (data != null && data.serviceName != null && !data.serviceName.isBlank()) {
+      summary.add(data.serviceName);
+    }
+    if (data != null && data.professionalName != null && !data.professionalName.isBlank()) {
+      summary.add("com " + data.professionalName);
+    }
+    if (data != null && data.date != null) {
+      summary.add("para " + formatDateBr(data.date));
+    }
+    if (data != null && data.time != null && !data.time.isBlank()) {
+      summary.add("as " + data.time);
+    }
+
+    if (!summary.isEmpty()) {
+      reply.append(": ").append(String.join(" ", summary));
+    } else {
+      reply.append('.');
+    }
+
+    if (data != null && data.customerName != null && !data.customerName.isBlank()) {
+      reply.append(" Tudo certo, ").append(data.customerName).append('.');
+    }
+
+    reply.append(" Se precisar de mais alguma coisa, e so me chamar.");
+    return reply.toString().trim();
+  }
+
+  private String formatDateBr(LocalDate date) {
+    return date == null ? null : DATE_BR_FORMATTER.format(date);
   }
 
   private String executeCancelarAgendamento(LlmBookingAgent.AgentAction action,
@@ -1866,15 +1938,31 @@ public class AssistantConversationService {
 
     int maxMessages = Math.max(maxHistoryMessages, 20);
     int keepMessages = Math.min(Math.max(keepHistoryMessages, 10), maxMessages);
-    if (data.chatHistory.size() <= maxMessages) {
-      return;
+    if (data.chatHistory.size() > maxMessages) {
+      List<ChatMessage> kept = new ArrayList<>(data.chatHistory.subList(
+          Math.max(0, data.chatHistory.size() - keepMessages),
+          data.chatHistory.size()));
+      data.chatHistory.clear();
+      data.chatHistory.addAll(kept);
     }
 
-    List<ChatMessage> kept = new ArrayList<>(data.chatHistory.subList(
-        Math.max(0, data.chatHistory.size() - keepMessages),
-        data.chatHistory.size()));
-    data.chatHistory.clear();
-    data.chatHistory.addAll(kept);
+    int historyCharsBudget = Math.max(maxHistoryChars, 600);
+    while (data.chatHistory.size() > 2 && estimateHistoryChars(data.chatHistory) > historyCharsBudget) {
+      data.chatHistory.remove(0);
+    }
+  }
+
+  private int estimateHistoryChars(List<ChatMessage> history) {
+    if (history == null || history.isEmpty()) return 0;
+
+    int total = 0;
+    for (ChatMessage message : history) {
+      if (message == null) continue;
+      if (message.role != null) total += message.role.length();
+      if (message.content != null) total += message.content.length();
+      total += 8;
+    }
+    return total;
   }
 
   private void applyBookingLeadSignals(ConversationData data, BookingLeadSignals signals) {
