@@ -30,6 +30,8 @@ import br.com.phdigitalcode.azzo.assistant.extractor.ServiceNameFinder;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.tenant.ContextoTenant;
 import br.com.phdigitalcode.azzo.assistant.llm.AgentSystemPromptBuilder;
 import br.com.phdigitalcode.azzo.assistant.llm.LlmBookingAgent;
+import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ServicoDto;
+import br.com.phdigitalcode.azzo.assistant.model.AssistantMessageResponse;
 import br.com.phdigitalcode.azzo.assistant.model.IntentPrediction;
 import br.com.phdigitalcode.azzo.assistant.model.IntentType;
 
@@ -54,6 +56,8 @@ class AssistantConversationServiceCostControlUnitTest {
   void setUp() throws Exception {
     setPrivateField("agentEnabled", true);
     setPrivateField("ttlMinutes", 120L);
+    setPrivateField("maxHistoryMessages", 80);
+    setPrivateField("keepHistoryMessages", 60);
     setPrivateField("llmMaxInputChars", 160);
     setPrivateField("shortResponseMaxTokens", 48);
 
@@ -79,7 +83,7 @@ class AssistantConversationServiceCostControlUnitTest {
     when(intentClassifier.classifyWithConfidence(anyString()))
         .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.93d));
 
-    service.process("qual o horario de funcionamento?", USER_ID, "Phelipp");
+    service.process("qual o horario de funcionamento?", USER_ID, null);
 
     ArgumentCaptor<LlmBookingAgent.AgentChatOptions> optionsCaptor =
         ArgumentCaptor.forClass(LlmBookingAgent.AgentChatOptions.class);
@@ -93,9 +97,6 @@ class AssistantConversationServiceCostControlUnitTest {
 
   @Test
   void deveCompactarMensagemMuitoLongaAntesDeEnviarAoLlm() {
-    when(intentClassifier.classifyWithConfidence(anyString()))
-        .thenReturn(new IntentPrediction(IntentType.BOOK, 0.95d));
-
     String longMessage = "quero agendar ".repeat(80);
     service.process(longMessage, USER_ID, "Phelipp");
 
@@ -107,6 +108,32 @@ class AssistantConversationServiceCostControlUnitTest {
     assertTrue(compacted.length() < longMessage.length());
     assertTrue(compacted.length() <= 300);
     assertTrue(compacted.contains("Mensagem longa truncada pelo sistema"));
+  }
+
+  @Test
+  void devePreservarServicoDataEHoraEmMensagemComplexaDeAgendamento() {
+    ServicoDto servico = new ServicoDto();
+    servico.id = UUID.randomUUID().toString();
+    servico.name = "Corte feminino";
+    when(serviceNameFinder.extractFirst(anyString())).thenReturn(java.util.Optional.empty());
+    when(domainService.resolveService(anyString(), anyString())).thenReturn(java.util.Optional.of(servico));
+    when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
+        .thenReturn(new LlmBookingAgent.AgentResult("Qual profissional você prefere?", List.of(), "GROQ"));
+
+    AssistantMessageResponse response =
+        service.process("quero agendar um corte amanha as 17:00", USER_ID, "Phelipp");
+
+    ArgumentCaptor<String> messageCaptor = ArgumentCaptor.forClass(String.class);
+    verify(llmBookingAgent).chat(anyString(), anyList(), messageCaptor.capture(), any(), any());
+
+    String contextualizedMessage = messageCaptor.getValue();
+    assertNotNull(response);
+    assertEquals("Corte feminino", response.slots.get("serviceName"));
+    assertEquals("17:00", response.slots.get("time"));
+    assertEquals(java.time.LocalDate.now().plusDays(1).toString(), response.slots.get("date"));
+    assertEquals("PROFESSIONAL_SELECTION", response.slots.get("reactivationStage"));
+    assertTrue(contextualizedMessage.contains("[Sistema: dados operacionais"));
+    assertTrue(contextualizedMessage.contains("horario=17:00"));
   }
 
   private void setPrivateField(String fieldName, Object value) throws Exception {

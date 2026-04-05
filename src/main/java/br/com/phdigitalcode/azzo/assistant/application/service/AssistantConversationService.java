@@ -71,8 +71,12 @@ public class AssistantConversationService {
   @Inject AgentSystemPromptBuilder agentSystemPromptBuilder;
   @Inject LlmBookingAgent llmBookingAgent;
 
-  @ConfigProperty(name = "assistant.conversation.ttl-minutes", defaultValue = "120")
+  @ConfigProperty(name = "assistant.conversation.ttl-minutes", defaultValue = "480")
   long ttlMinutes;
+  @ConfigProperty(name = "assistant.conversation.max-history-messages", defaultValue = "80")
+  int maxHistoryMessages;
+  @ConfigProperty(name = "assistant.conversation.keep-history-messages", defaultValue = "60")
+  int keepHistoryMessages;
   @ConfigProperty(name = "assistant.greeting-zone", defaultValue = "America/Sao_Paulo")
   String greetingZone;
   @ConfigProperty(name = "assistant.intent.min-confidence", defaultValue = "0.62")
@@ -81,7 +85,7 @@ public class AssistantConversationService {
   double ollamaMinConfidence;
   @ConfigProperty(name = "assistant.agent.enabled", defaultValue = "false")
   boolean agentEnabled;
-  @ConfigProperty(name = "assistant.llm.max-input-chars", defaultValue = "600")
+  @ConfigProperty(name = "assistant.llm.max-input-chars", defaultValue = "1000")
   int llmMaxInputChars;
   @ConfigProperty(name = "assistant.llm.short-response-max-tokens", defaultValue = "48")
   int shortResponseMaxTokens;
@@ -202,18 +206,17 @@ public class AssistantConversationService {
     String normalized = TextNormalizer.normalize(rawMessage);
 
     // Limita o histórico a 30 mensagens para não estourar o contexto do LLM
-    if (data.chatHistory.size() > 30) {
-      List<ChatMessage> kept = new ArrayList<>(data.chatHistory.subList(
-          Math.max(0, data.chatHistory.size() - 25), data.chatHistory.size()));
-      data.chatHistory.clear();
-      data.chatHistory.addAll(kept);
-    }
+    BookingLeadSignals bookingLead = detectBookingLeadSignals(rawMessage, data, tenantId);
+    applyBookingLeadSignals(data, bookingLead);
+    syncBookingStageFromKnownSlots(data);
+    trimChatHistory(data);
 
     // Resolve datas relativas em Java antes de enviar ao LLM (modelos 8B erram esse cálculo)
     String contextualMessage = contextualizeAgentSelection(data, rawMessage, normalized);
+    contextualMessage = appendBookingContextForAgent(data, contextualMessage, bookingLead);
     String enrichedMessage = enrichDatesInMessage(contextualMessage);
     String compactedMessage = compactMessageForLlm(enrichedMessage);
-    LlmBookingAgent.AgentChatOptions chatOptions = buildAgentChatOptions(data, rawMessage);
+    LlmBookingAgent.AgentChatOptions chatOptions = buildAgentChatOptions(data, rawMessage, tenantId);
 
     String systemPrompt = agentSystemPromptBuilder.build(tenantId);
     // Passa activeProvider para sticky routing — null = nova conversa, router decide
@@ -253,6 +256,7 @@ public class AssistantConversationService {
     // Grava no histórico para próximos turnos (usa mensagem enriquecida para consistência)
     data.chatHistory.add(new ChatMessage("user", compactedMessage));
     data.chatHistory.add(new ChatMessage("assistant", finalReply));
+    trimChatHistory(data);
 
     return finalReply;
   }
@@ -480,8 +484,16 @@ public class AssistantConversationService {
       return handleReactivationReply(data, rawMessage, normalized, userIdentifier, tenantId);
     }
 
+    BookingLeadSignals bookingLead = detectBookingLeadSignals(rawMessage, data, tenantId);
+    applyBookingLeadSignals(data, bookingLead);
+    syncBookingStageFromKnownSlots(data);
+    boolean hasOperationalBookingLead = hasOperationalBookingLead(bookingLead);
+
     boolean prioritizeSlotInput = shouldPrioritizeSlotInput(data, rawMessage, normalized);
-    if (!prioritizeSlotInput && isDeterministicGreeting(normalized) && data.stage != ConversationStage.CONFIRMATION) {
+    if (!hasOperationalBookingLead
+        && !prioritizeSlotInput
+        && isDeterministicGreeting(normalized)
+        && data.stage != ConversationStage.CONFIRMATION) {
       return greetingReplyForCurrentStage(data, tenantId);
     }
 
@@ -496,7 +508,9 @@ public class AssistantConversationService {
     intentPrediction = enrichIntentWithOllama(intentPrediction, rawMessage, data.stage);
     intent = intentPrediction.intent;
 
-    String disambiguationReply = handleLowConfidenceIntent(data, intentPrediction, prioritizeSlotInput);
+    String disambiguationReply = hasOperationalBookingLead
+        ? null
+        : handleLowConfidenceIntent(data, intentPrediction, prioritizeSlotInput);
     if (disambiguationReply != null) {
       return disambiguationReply;
     }
@@ -536,20 +550,23 @@ public class AssistantConversationService {
       return "Não entendi direito. Manda *SIM* pra confirmar ou *NÃO* pra cancelar, tá? 😊";
     }
 
-    if (!prioritizeSlotInput && intent == IntentType.GREETING && data.stage != ConversationStage.CONFIRMATION) {
+    if (!hasOperationalBookingLead
+        && !prioritizeSlotInput
+        && intent == IntentType.GREETING
+        && data.stage != ConversationStage.CONFIRMATION) {
       return greetingReplyForCurrentStage(data, tenantId);
     }
-    if (!prioritizeSlotInput && intent == IntentType.LIST) {
+    if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.LIST) {
       data.stage = ConversationStage.START;
       return domainService.listUpcomingForUser(tenantId, userIdentifier);
     }
-    if (!prioritizeSlotInput && intent == IntentType.CANCEL) {
+    if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.CANCEL) {
       if (!domainService.canCancelViaWhatsApp(tenantId)) {
         return "Esse salão não permite cancelamentos pelo WhatsApp agora. 😕";
       }
       return iniciarFluxoCancelamento(data, userIdentifier, tenantId);
     }
-    if (!prioritizeSlotInput && intent == IntentType.RESCHEDULE) {
+    if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.RESCHEDULE) {
       if (!domainService.canRescheduleViaWhatsApp(tenantId)) {
         return "Esse salão não permite remarcações pelo WhatsApp agora. 😕";
       }
@@ -557,7 +574,7 @@ public class AssistantConversationService {
     }
 
     // Pergunta de preço/valor: responde com a lista de serviços incluindo preços
-    if (!prioritizeSlotInput && isPriceQuery(normalized)
+    if (!hasOperationalBookingLead && !prioritizeSlotInput && isPriceQuery(normalized)
         && data.stage != ConversationStage.CONFIRMATION) {
       return domainService.formatServicesPromptForCustomer(tenantId, data.customerName);
     }
@@ -628,20 +645,19 @@ public class AssistantConversationService {
       if (!domainService.canScheduleViaWhatsApp(tenantId)) {
         return "Esse salão não permite novos agendamentos pelo WhatsApp agora. 😕";
       }
-      data.stage = (data.customerName != null && !data.customerName.isBlank())
-          ? ConversationStage.ASK_SERVICE
-          : ConversationStage.ASK_NAME;
+      syncBookingStageFromKnownSlots(data);
     }
 
     if (data.customerName == null || data.customerName.isBlank()) {
       String maybeName = extractCustomerName(rawMessage);
       if (maybeName != null) {
         data.customerName = maybeName;
-        data.stage = ConversationStage.ASK_SERVICE;
+        data.stageAttempts = 0;
+        syncBookingStageFromKnownSlots(data);
         // Retorna imediatamente — a mesma mensagem do nome NÃO deve ser reutilizada
         // para resolução de serviço, evitando que o Ollama alucie um serviço a partir
         // do nome do cliente (ex: "Carlos Silva" → "Barba").
-        return domainService.formatServicesPrompt(tenantId);
+        return promptForSyncedStage(data, tenantId);
       } else {
         data.stage = ConversationStage.ASK_NAME;
         return "Oi! Pra começar, me conta seu nome completo. 😊";
@@ -758,7 +774,7 @@ public class AssistantConversationService {
       }
     }
 
-    if (data.preferredPeriod == null) {
+    if (data.preferredPeriod == null && data.time == null) {
       Optional<TimePeriod> period = TimePeriod.fromText(normalized);
       // Fallback Ollama: expressões como "de manhã cedo", "pós-almoço", "fim do dia"
       if (period.isEmpty()) {
@@ -803,7 +819,7 @@ public class AssistantConversationService {
       }
       if (data.availableTimeOptions.isEmpty()) {
         data.stage = ConversationStage.ASK_TIME;
-        return "Não tem horário vago de " + data.preferredPeriod.label()
+        return "Não tem horário vago de " + preferredPeriodLabel(data)
             + " nessa data. 😕 Quer tentar outro período (manhã/tarde/noite) ou mudar o dia?";
       }
 
@@ -818,7 +834,7 @@ public class AssistantConversationService {
             data.time = normalizedTime;
           } else {
             data.stage = ConversationStage.ASK_TIME;
-            return "Esse horário não está disponível. Escolha um dos vagos de " + data.preferredPeriod.label() + ":\n"
+            return "Esse horário não está disponível. Escolha um dos vagos de " + preferredPeriodLabel(data) + ":\n"
                 + buildNumberedTimeList(data.availableTimeOptions)
                 + "\nOu fala outro período ou \"trocar dia\" pra mudar. 😊";
           }
@@ -829,11 +845,11 @@ public class AssistantConversationService {
         data.stage = ConversationStage.ASK_TIME;
         String bestSlot = data.availableTimeOptions.isEmpty() ? null : data.availableTimeOptions.get(0);
         java.util.Optional<String> llmTime = ollamaResponseService.generateTimeSlotsMessage(
-            data.preferredPeriod.label(), data.availableTimeOptions, bestSlot);
+            preferredPeriodLabel(data), data.availableTimeOptions, bestSlot);
         if (llmTime.isPresent()) {
           return llmTime.get();
         }
-        return "Qual horário de " + data.preferredPeriod.label() + " fica bom? Escolha pelo número:\n"
+        return "Qual horário de " + preferredPeriodLabel(data) + " fica bom? Escolha pelo número:\n"
             + buildNumberedTimeList(data.availableTimeOptions)
             + "\nOu fala outro período ou \"trocar dia\". 😊";
       }
@@ -870,7 +886,7 @@ public class AssistantConversationService {
         return "Esse horário ficou indisponível e não tem mais vaga nesse período. 😕 "
             + "Quer tentar outro período (manhã/tarde/noite) ou mudar o dia?";
       }
-      return "Esse horário ficou indisponível. Escolha outro de " + data.preferredPeriod.label() + ":\n"
+      return "Esse horário ficou indisponível. Escolha outro de " + preferredPeriodLabel(data) + ":\n"
           + buildNumberedTimeList(data.availableTimeOptions);
     }
 
@@ -907,7 +923,7 @@ public class AssistantConversationService {
               + "Quer mudar o período (manhã/tarde/noite) ou o dia?";
         }
         return "Esse horário acabou de ser reservado por outro cliente. Escolha um novo de "
-            + data.preferredPeriod.label() + ":\n" + buildNumberedTimeList(data.availableTimeOptions);
+            + preferredPeriodLabel(data) + ":\n" + buildNumberedTimeList(data.availableTimeOptions);
       }
     }
 
@@ -1806,8 +1822,8 @@ public class AssistantConversationService {
     return compacted;
   }
 
-  LlmBookingAgent.AgentChatOptions buildAgentChatOptions(ConversationData data, String rawMessage) {
-    if (!shouldUseShortReplyMode(data, rawMessage)) {
+  LlmBookingAgent.AgentChatOptions buildAgentChatOptions(ConversationData data, String rawMessage, String tenantId) {
+    if (!shouldUseShortReplyMode(data, rawMessage, tenantId)) {
       return LlmBookingAgent.AgentChatOptions.defaultOptions();
     }
 
@@ -1822,10 +1838,16 @@ public class AssistantConversationService {
         """);
   }
 
-  boolean shouldUseShortReplyMode(ConversationData data, String rawMessage) {
+  boolean shouldUseShortReplyMode(ConversationData data, String rawMessage, String tenantId) {
     if (rawMessage == null || rawMessage.isBlank()) return false;
     if (data == null) return false;
-    if (data.stage != ConversationStage.START && data.stage != ConversationStage.COMPLETED) {
+    if (data.stage != ConversationStage.START
+        && data.stage != ConversationStage.COMPLETED
+        && data.stage != ConversationStage.ASK_NAME
+        && data.stage != ConversationStage.ASK_SERVICE) {
+      return false;
+    }
+    if (tenantId != null && detectBookingLeadSignals(rawMessage, data, tenantId).detected) {
       return false;
     }
 
@@ -1837,6 +1859,131 @@ public class AssistantConversationService {
       LOG.debugf("[Agent] Falha ao classificar pergunta padrao para resposta curta: %s", e.getMessage());
       return false;
     }
+  }
+
+  private void trimChatHistory(ConversationData data) {
+    if (data == null || data.chatHistory == null) return;
+
+    int maxMessages = Math.max(maxHistoryMessages, 20);
+    int keepMessages = Math.min(Math.max(keepHistoryMessages, 10), maxMessages);
+    if (data.chatHistory.size() <= maxMessages) {
+      return;
+    }
+
+    List<ChatMessage> kept = new ArrayList<>(data.chatHistory.subList(
+        Math.max(0, data.chatHistory.size() - keepMessages),
+        data.chatHistory.size()));
+    data.chatHistory.clear();
+    data.chatHistory.addAll(kept);
+  }
+
+  private void applyBookingLeadSignals(ConversationData data, BookingLeadSignals signals) {
+    if (data == null || signals == null) return;
+
+    if (data.serviceId == null && signals.serviceId != null) {
+      try {
+        data.serviceId = UUID.fromString(signals.serviceId);
+      } catch (IllegalArgumentException ignored) {
+        // mantem apenas o nome do servico quando o id vier invalido.
+      }
+    }
+    if ((data.serviceName == null || data.serviceName.isBlank()) && signals.serviceName != null) {
+      data.serviceName = signals.serviceName;
+    }
+    if (data.date == null && signals.date != null) {
+      try {
+        data.date = LocalDate.parse(signals.date);
+      } catch (RuntimeException ignored) {
+        // deixa o fluxo pedir a data novamente se o parsing falhar.
+      }
+    }
+    if ((data.time == null || data.time.isBlank()) && signals.time != null) {
+      data.time = signals.time;
+    }
+  }
+
+  private boolean hasOperationalBookingLead(BookingLeadSignals signals) {
+    return signals != null
+        && (signals.serviceId != null
+            || signals.serviceName != null
+            || signals.date != null
+            || signals.time != null);
+  }
+
+  private void syncBookingStageFromKnownSlots(ConversationData data) {
+    if (data == null || data.stage == null) return;
+    if (data.stage == ConversationStage.AWAITING_APPOINTMENT_CONFIRMATION
+        || data.stage == ConversationStage.AWAITING_REACTIVATION_REPLY
+        || data.stage == ConversationStage.ASK_CANCEL_APPOINTMENT
+        || data.stage == ConversationStage.ASK_RESCHEDULE_APPOINTMENT
+        || data.stage == ConversationStage.CONFIRMATION) {
+      return;
+    }
+
+    if (data.customerName == null || data.customerName.isBlank()) {
+      data.stage = ConversationStage.ASK_NAME;
+    } else if (data.serviceId == null) {
+      data.stage = ConversationStage.ASK_SERVICE;
+    } else if (data.professionalId == null) {
+      data.stage = ConversationStage.ASK_PROFESSIONAL;
+    } else if (data.date == null) {
+      data.stage = ConversationStage.ASK_DATE;
+    } else if (data.time == null) {
+      data.stage = data.preferredPeriod == null ? ConversationStage.ASK_PERIOD : ConversationStage.ASK_TIME;
+    } else {
+      data.stage = ConversationStage.ASK_TIME;
+    }
+  }
+
+  private String promptForSyncedStage(ConversationData data, String tenantId) {
+    if (data == null || data.stage == null) {
+      return domainService.formatServicesPrompt(tenantId);
+    }
+
+    return switch (data.stage) {
+      case ASK_NAME -> "Oi! Pra começar, me conta seu nome completo. 😊";
+      case ASK_SERVICE -> domainService.formatServicesPrompt(tenantId);
+      case ASK_PROFESSIONAL -> buildProfessionalPrompt(data, tenantId);
+      case ASK_DATE -> "Perfeito! Agora me fala o dia que você prefere. 📅";
+      case ASK_PERIOD -> "Legal! Prefere de manhã, tarde ou noite? ☀️🌙";
+      case ASK_TIME -> "Ótimo! Agora me fala o horário que você prefere. ⏰";
+      default -> domainService.formatServicesPrompt(tenantId);
+    };
+  }
+
+  private String appendBookingContextForAgent(ConversationData data, String message, BookingLeadSignals bookingLead) {
+    if (message == null || message.isBlank() || data == null) return message;
+
+    List<String> recognized = new ArrayList<>();
+    if (data.customerName != null && !data.customerName.isBlank()) recognized.add("cliente=" + data.customerName);
+    if (data.serviceName != null && !data.serviceName.isBlank()) recognized.add("servico=" + data.serviceName);
+    if (data.professionalName != null && !data.professionalName.isBlank()) recognized.add("profissional=" + data.professionalName);
+    if (data.date != null) recognized.add("data=" + data.date);
+    if (data.time != null && !data.time.isBlank()) recognized.add("horario=" + data.time);
+    if (recognized.isEmpty() && (bookingLead == null || !bookingLead.detected)) {
+      return message;
+    }
+
+    String pending = switch (data.stage) {
+      case ASK_NAME -> "nome do cliente";
+      case ASK_SERVICE -> "servico";
+      case ASK_PROFESSIONAL -> "profissional";
+      case ASK_DATE -> "data";
+      case ASK_PERIOD -> "periodo";
+      case ASK_TIME -> "horario";
+      case CONFIRMATION -> "confirmacao final";
+      default -> "proximo passo do agendamento";
+    };
+
+    return message + "\n[Sistema: dados operacionais já identificados nesta conversa -> "
+        + String.join(", ", recognized)
+        + ". Conduza apenas o que falta agora: "
+        + pending
+        + ".]";
+  }
+
+  private String preferredPeriodLabel(ConversationData data) {
+    return data != null && data.preferredPeriod != null ? data.preferredPeriod.label() : "esse período";
   }
 
   private BookingLeadSignals detectBookingLeadSignals(String rawMessage, ConversationData data, String tenantId) {
