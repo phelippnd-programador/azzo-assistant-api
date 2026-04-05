@@ -252,6 +252,10 @@ public class AssistantDomainService {
       String userIdentifier,
       String customerName) {
 
+    if (!isSlotAvailable(tenantId, professionalId, date, time, serviceId)) {
+      throw new IllegalStateException("Horario indisponivel para criacao do agendamento");
+    }
+
     ClienteDto client = resolveOrCreateClient(tenantId, userIdentifier, customerName);
 
     AgendamentoCreateDto req = new AgendamentoCreateDto();

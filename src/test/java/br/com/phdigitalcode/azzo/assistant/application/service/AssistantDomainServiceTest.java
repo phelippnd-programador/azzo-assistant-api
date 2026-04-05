@@ -3,6 +3,7 @@ package br.com.phdigitalcode.azzo.assistant.application.service;
 import br.com.phdigitalcode.azzo.assistant.dialogue.TimePeriod;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.AgendaProInternalClient;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.*;
+import br.com.phdigitalcode.azzo.assistant.llm.OllamaResponseService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -26,6 +27,9 @@ class AssistantDomainServiceTest {
 
     @Mock
     AgendaProInternalClient agendaProClient;
+
+    @Mock
+    OllamaResponseService ollamaResponseService;
 
     @InjectMocks
     AssistantDomainService service;
@@ -350,5 +354,28 @@ class AssistantDomainServiceTest {
                 .thenThrow(new RuntimeException("not found"));
 
         assertTrue(service.resolveRegisteredCustomerName(TENANT, "+5511999999999").isEmpty());
+    }
+
+    @Test
+    @DisplayName("createPendingAppointment: falha quando o horario nao estiver mais disponivel")
+    void createPendingAppointment_bloqueiaHorarioIndisponivel() {
+        when(agendaProClient.listarServicos(TENANT)).thenReturn(List.of(
+                servicoAtivo(SERVICE_ID.toString(), "Corte", 30)
+        ));
+        when(agendaProClient.buscarSlotsDisponiveis(eq(TENANT), eq(PROFESSIONAL_ID.toString()), anyString(), eq(SERVICE_ID.toString()), eq(30), eq(0)))
+                .thenReturn(List.of(slot("09:00", false)));
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> service.createPendingAppointment(
+                        TENANT,
+                        SERVICE_ID,
+                        PROFESSIONAL_ID,
+                        LocalDate.now().plusDays(1),
+                        "09:00",
+                        "+5511999999999",
+                        "Ana"));
+
+        assertTrue(error.getMessage().contains("indisponivel"));
+        verify(agendaProClient, never()).criarAgendamento(anyString(), any());
     }
 }

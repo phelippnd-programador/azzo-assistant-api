@@ -6,6 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -67,7 +69,7 @@ class AssistantConversationServiceCostControlUnitTest {
 
     UUID tenantId = UUID.randomUUID();
     when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
-    when(agentSystemPromptBuilder.build(anyString())).thenReturn("prompt-base");
+    lenient().when(agentSystemPromptBuilder.build(anyString())).thenReturn("prompt-base");
     when(stateManager.toJson(any(ConversationData.class))).thenReturn("{}");
 
     ConversationStateEntity entity = new ConversationStateEntity();
@@ -78,7 +80,7 @@ class AssistantConversationServiceCostControlUnitTest {
 
     when(stateManager.loadOrCreate(any(), anyString(), any())).thenReturn(entity);
     when(stateManager.parseState("{}")).thenReturn(new ConversationData());
-    when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
+    lenient().when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
         .thenReturn(new LlmBookingAgent.AgentResult("Oi", List.of(), "GROQ"));
   }
 
@@ -174,6 +176,48 @@ class AssistantConversationServiceCostControlUnitTest {
     assertTrue(response.reply.contains("1. 09:00"));
     assertTrue(response.reply.contains("2. 09:30"));
     verify(llmBookingAgent).chat(anyString(), anyList(), anyString(), any(), any());
+  }
+
+  @Test
+  void devePrecarregarHorariosReaisNoContextoDaPrimeiraChamadaAoLlm() {
+    service.llmMaxInputChars = 3000;
+    ConversationData data = new ConversationData();
+    data.stage = ConversationStage.ASK_TIME;
+    data.customerName = "Phelipp";
+    data.serviceId = UUID.randomUUID();
+    data.serviceName = "Corte feminino";
+    data.professionalId = UUID.randomUUID();
+    data.professionalName = "Ana";
+    data.date = LocalDate.now().plusDays(1);
+    when(stateManager.parseState("{}")).thenReturn(data);
+    when(domainService.suggestTimes(anyString(), any(), any(), any(), any()))
+        .thenReturn(List.of("09:00", "09:30"));
+    when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
+        .thenReturn(new LlmBookingAgent.AgentResult("Tenho dois horarios para voce.", List.of(), "GROQ"));
+
+    service.process("quais horarios tem?", USER_ID, "Phelipp");
+
+    ArgumentCaptor<String> messageCaptor = ArgumentCaptor.forClass(String.class);
+    verify(llmBookingAgent).chat(anyString(), anyList(), messageCaptor.capture(), any(), any());
+    String contextualizedMessage = messageCaptor.getValue();
+    assertTrue(contextualizedMessage.contains("horarios reais ja consultados"));
+    assertTrue(contextualizedMessage.contains("1. 09:00"));
+    assertTrue(contextualizedMessage.contains("2. 09:30"));
+  }
+
+  @Test
+  void deveListarAgendamentosSemEsperarSegundaMensagemNoModoAgent() {
+    when(intentClassifier.classifyWithConfidence(anyString()))
+        .thenReturn(new IntentPrediction(IntentType.LIST, 0.95d));
+    when(domainService.listUpcomingForUser(anyString(), anyString()))
+        .thenReturn("Seus proximos agendamentos:\n- Corte com Ana em 2026-04-10 as 09:00");
+
+    AssistantMessageResponse response = service.process("quais sao meus agendamentos?", USER_ID, "Phelipp");
+
+    assertNotNull(response);
+    assertTrue(response.reply.contains("Seus proximos agendamentos"));
+    verify(domainService).listUpcomingForUser(anyString(), eq(USER_ID));
+    org.mockito.Mockito.verifyNoInteractions(llmBookingAgent);
   }
 
   private void setPrivateField(String fieldName, Object value) throws Exception {
