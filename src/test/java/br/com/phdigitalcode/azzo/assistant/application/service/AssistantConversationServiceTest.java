@@ -160,7 +160,7 @@ class AssistantConversationServiceTest {
         assertNotNull(response.reply);
         assertTrue(response.reply.toLowerCase().contains("nome"),
                 "Deve pedir o nome do cliente. Reply: " + response.reply);
-        assertEquals(ConversationStage.ASK_NAME.name(), response.stage);
+        assertEquals(ConversationStage.ASK_NAME, response.stage);
     }
 
     @Test
@@ -178,7 +178,7 @@ class AssistantConversationServiceTest {
         AssistantMessageResponse response = service.process("quero agendar", USER_ID, USER_NAME);
 
         assertNotNull(response);
-        assertEquals(ConversationStage.ASK_SERVICE.name(), response.stage);
+        assertEquals(ConversationStage.ASK_SERVICE, response.stage);
         assertEquals(USER_NAME, response.slots.get("customerName"));
     }
 
@@ -226,7 +226,7 @@ class AssistantConversationServiceTest {
         assertTrue(
                 response.reply.toLowerCase().contains("data ja passou") || response.reply.toLowerCase().contains("passou"),
                 "Deve informar que a data já passou. Reply: " + response.reply);
-        assertEquals(ConversationStage.ASK_DATE.name(), response.stage);
+        assertEquals(ConversationStage.ASK_DATE, response.stage);
     }
 
     @Test
@@ -249,7 +249,7 @@ class AssistantConversationServiceTest {
         AssistantMessageResponse response = service.process(input, USER_ID, USER_NAME);
 
         assertNotNull(response);
-        assertEquals(ConversationStage.ASK_PERIOD.name(), response.stage);
+        assertEquals(ConversationStage.ASK_PERIOD, response.stage);
         assertTrue(response.reply.toLowerCase().contains("manha") || response.reply.toLowerCase().contains("tarde"),
                 "Deve pedir o período. Reply: " + response.reply);
     }
@@ -347,7 +347,7 @@ class AssistantConversationServiceTest {
 
         assertNotNull(response);
         // Conversa reinicia do zero → deve pedir nome
-        assertEquals(ConversationStage.ASK_NAME.name(), response.stage);
+        assertEquals(ConversationStage.ASK_NAME, response.stage);
     }
 
     // ─── extração de nome ─────────────────────────────────────────────────────
@@ -368,7 +368,7 @@ class AssistantConversationServiceTest {
         assertNotNull(response);
         // Deve continuar pedindo o nome
         assertTrue(
-                ConversationStage.ASK_NAME.name().equals(response.stage)
+                ConversationStage.ASK_NAME == response.stage
                         || response.reply.toLowerCase().contains("nome"),
                 "Não deve aceitar número como nome. Stage: " + response.stage + ", Reply: " + response.reply);
     }
@@ -389,7 +389,7 @@ class AssistantConversationServiceTest {
 
         assertNotNull(response);
         // Nome foi aceito → avança para ASK_SERVICE
-        assertEquals(ConversationStage.ASK_SERVICE.name(), response.stage,
+        assertEquals(ConversationStage.ASK_SERVICE, response.stage,
                 "Nome válido deve avançar para ASK_SERVICE. Reply: " + response.reply);
         assertEquals("Ana Lima", response.slots.get("customerName"));
     }
@@ -450,7 +450,7 @@ class AssistantConversationServiceTest {
         AssistantMessageResponse response = service.process("sim", USER_ID, USER_NAME);
 
         assertNotNull(response);
-        assertEquals(ConversationStage.ASK_SERVICE.name(), response.stage);
+        assertEquals(ConversationStage.ASK_SERVICE, response.stage);
         assertTrue(response.reply.toLowerCase().contains("retomar"),
                 "Deve indicar retomada do fluxo. Reply: " + response.reply);
         assertTrue(response.reply.toLowerCase().contains("servico"),
@@ -471,7 +471,7 @@ class AssistantConversationServiceTest {
         AssistantMessageResponse response = service.process("nao quero", USER_ID, USER_NAME);
 
         assertNotNull(response);
-        assertEquals(ConversationStage.START.name(), response.stage);
+        assertEquals(ConversationStage.START, response.stage);
         assertTrue(response.reply.toLowerCase().contains("tudo certo"),
                 "Deve encerrar o contexto de reativacao. Reply: " + response.reply);
     }

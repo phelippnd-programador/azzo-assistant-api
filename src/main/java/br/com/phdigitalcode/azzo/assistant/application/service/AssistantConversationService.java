@@ -131,7 +131,7 @@ public class AssistantConversationService {
 
     AssistantMessageResponse response = new AssistantMessageResponse();
     response.reply = reply;
-    response.stage = data.stage.name();
+    response.stage = data.stage;
     response.slots = new LinkedHashMap<>();
     response.slots.put("serviceId", data.serviceId);
     response.slots.put("serviceName", data.serviceName);
