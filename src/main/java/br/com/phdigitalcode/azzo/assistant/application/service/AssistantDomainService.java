@@ -3,10 +3,13 @@ package br.com.phdigitalcode.azzo.assistant.application.service;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -40,6 +43,11 @@ public class AssistantDomainService {
   private static final String CHANNEL_ASSISTANT_CONFIRMATION = "ASSISTANT_CONFIRMATION";
   private static final String CHANNEL_ASSISTANT_CANCELLATION = "ASSISTANT_CANCELLATION";
   private static final String STATUS_NOTIF_SENT = "SENT";
+  private static final Set<String> SERVICE_INTENT_STOP_WORDS = Set.of(
+      "quero", "queria", "gostaria", "preciso", "precisar", "fazer", "fazeria", "algo",
+      "servico", "servicos", "atendimento", "trabalho", "trabalhar", "agendar", "marcar",
+      "meu", "minha", "pro", "pra", "para", "com", "sem", "um", "uma", "o", "a", "os",
+      "as", "de", "do", "da", "dos", "das", "no", "na", "nos", "nas", "e", "ou");
 
   @Inject
   @RestClient
@@ -58,15 +66,35 @@ public class AssistantDomainService {
   }
 
   public Optional<ServicoDto> resolveService(String tenantId, String candidate) {
-    String normalized = TextNormalizer.normalize(candidate);
-    if (normalized.isBlank()) return Optional.empty();
+    ServiceIntentContext intent = buildServiceIntentContext(candidate);
+    if (intent.searchTerms().isEmpty()) return Optional.empty();
 
-    return listServices(tenantId).stream()
-        .sorted((left, right) -> Integer.compare(
-            scoreMatch(TextNormalizer.normalize(right.name), normalized),
-            scoreMatch(TextNormalizer.normalize(left.name), normalized)))
-        .filter(s -> scoreMatch(TextNormalizer.normalize(s.name), normalized) > 0)
-        .findFirst();
+    List<ScoredServiceMatch> matches = scoreServices(tenantId, intent, 3);
+    if (matches.isEmpty()) return Optional.empty();
+
+    ScoredServiceMatch best = matches.get(0);
+    ScoredServiceMatch second = matches.size() > 1 ? matches.get(1) : null;
+    boolean exactNameMatch = TextNormalizer.normalize(best.service().name).equals(intent.normalizedCandidate());
+    if (intent.ambiguousTopic() && !exactNameMatch) {
+      return Optional.empty();
+    }
+    boolean strongEnough = best.score() >= 65;
+    boolean clearlyAhead = second == null || best.score() >= second.score() + 20;
+
+    if (exactNameMatch || (strongEnough && clearlyAhead)) {
+      return Optional.of(best.service());
+    }
+    return Optional.empty();
+  }
+
+  public List<ServicoDto> findMatchingServices(String tenantId, String candidate, int limit) {
+    ServiceIntentContext intent = buildServiceIntentContext(candidate);
+    if (intent.searchTerms().isEmpty()) return List.of();
+
+    int normalizedLimit = Math.max(1, Math.min(limit, 10));
+    return scoreServices(tenantId, intent, normalizedLimit).stream()
+        .map(ScoredServiceMatch::service)
+        .toList();
   }
 
   public String formatServicesPrompt(String tenantId) {
@@ -95,6 +123,39 @@ public class AssistantDomainService {
       }
     }
     sb.append("\n\nManda o número ou o nome do serviço! 😊");
+    return sb.toString();
+  }
+
+  public String formatServiceOptionsPrompt(String tenantId, String customerName, String candidate, List<ServicoDto> services) {
+    if (services == null || services.isEmpty()) {
+      return formatServicesPromptForCustomer(tenantId, customerName);
+    }
+
+    ServiceIntentContext intent = buildServiceIntentContext(candidate);
+    StringBuilder sb = new StringBuilder();
+    if (customerName != null && !customerName.isBlank()) {
+      sb.append("Entendi, ").append(customerName).append(". ");
+    } else {
+      sb.append("Entendi. ");
+    }
+    sb.append("Nao consegui identificar exatamente o servico");
+    if (!intent.humanLabel().isBlank()) {
+      sb.append(" que voce quer");
+      sb.append(", mas pelo que voce descreveu parece algo de ").append(intent.humanLabel());
+    }
+    sb.append(". Tenho estas opcoes:\n");
+
+    int idx = 1;
+    for (ServicoDto s : services.stream().limit(5).toList()) {
+      sb.append("\n").append(idx++).append(" - ").append(s.name);
+      if (s.price > 0) sb.append(" — R$ ").append(String.format(Locale.ROOT, "%.2f", s.price / 100.0).replace('.', ','));
+      if (s.duration > 0) sb.append(" | ").append(formatDurationMinutes(s.duration));
+      if (s.description != null && !s.description.isBlank()) {
+        sb.append("\n   ").append(s.description.trim());
+      }
+    }
+
+    sb.append("\n\nSe for um destes, me manda o numero ou o nome. Se nao, me descreve um pouco melhor.");
     return sb.toString();
   }
 
@@ -466,10 +527,300 @@ public class AssistantDomainService {
   // ─── Utilitários ──────────────────────────────────────────────────────────
 
   private int scoreMatch(String value, String candidate) {
-    if (value.equals(candidate)) return 3;
-    if (value.contains(candidate) || candidate.contains(value)) return 2;
-    if (value.split(" ")[0].equals(candidate.split(" ")[0])) return 1;
+    if (value.equals(candidate)) return 40;
+    if (value.contains(candidate) || candidate.contains(value)) return 24;
+    if (value.split(" ")[0].equals(candidate.split(" ")[0])) return 10;
     return 0;
+  }
+
+  private List<ScoredServiceMatch> scoreServices(String tenantId, ServiceIntentContext intent, int limit) {
+    int normalizedLimit = Math.max(1, Math.min(limit, 10));
+    return listServices(tenantId).stream()
+        .map(service -> new ScoredServiceMatch(service, scoreService(service, intent)))
+        .filter(match -> match.score() > 0)
+        .sorted((left, right) -> Integer.compare(right.score(), left.score()))
+        .limit(normalizedLimit)
+        .toList();
+  }
+
+  private int scoreService(ServicoDto service, ServiceIntentContext intent) {
+    String normalizedName = TextNormalizer.normalize(service.name);
+    String normalizedDescription = TextNormalizer.normalize(service.description);
+    String normalizedCategory = TextNormalizer.normalize(service.category);
+    List<String> serviceNameTokens = meaningfulTokens(normalizedName);
+    List<String> serviceDescriptionTokens = meaningfulTokens(normalizedDescription);
+    List<String> serviceCategoryTokens = meaningfulTokens(normalizedCategory);
+
+    int score = scoreMatch(normalizedName, intent.normalizedCandidate());
+    if (!intent.normalizedTopic().isBlank()) {
+      score += scoreMatch(normalizedCategory, intent.normalizedTopic());
+      score += scoreMatch(normalizedName, intent.normalizedTopic());
+    }
+
+    for (String term : intent.searchTerms()) {
+      if (term.isBlank()) continue;
+      if (normalizedName.equals(term)) {
+        score += 80;
+      } else if (normalizedName.contains(term)) {
+        score += 30;
+      } else if (normalizedCategory.contains(term)) {
+        score += 18;
+      } else if (normalizedDescription.contains(term)) {
+        score += 10;
+      }
+
+      score += scoreTokenSimilarity(term, serviceNameTokens, 45);
+      score += scoreTokenSimilarity(term, serviceCategoryTokens, 22);
+      score += scoreTokenSimilarity(term, serviceDescriptionTokens, 12);
+    }
+
+    return score;
+  }
+
+  private ServiceIntentContext buildServiceIntentContext(String candidate) {
+    String normalized = TextNormalizer.normalize(candidate);
+    if (normalized.isBlank()) return new ServiceIntentContext("", "", "", List.of(), false);
+
+    String topic = normalized;
+    String label = "";
+    boolean ambiguousTopic = meaningfulTokens(normalized).size() <= 1;
+    Set<String> terms = new LinkedHashSet<>();
+    terms.add(normalized);
+    terms.addAll(meaningfulTokens(normalized));
+
+    if ((normalized.contains("cortar") || normalized.contains("corte")) && normalized.contains("cabelo")) {
+      topic = "corte";
+      label = "corte";
+      ambiguousTopic = false;
+      terms.add("corte");
+      terms.add("cabelo");
+    }
+    if (normalized.contains("barba") || normalized.contains("barbear")) {
+      topic = "barba";
+      label = "barba";
+      ambiguousTopic = false;
+      terms.add("barba");
+    }
+    if (normalized.contains("unha") || normalized.contains("manicure") || normalized.contains("pedicure")) {
+      topic = "unha";
+      label = "unhas";
+      ambiguousTopic = false;
+      terms.add("unha");
+      terms.add("manicure");
+      terms.add("pedicure");
+    }
+    if (normalized.contains("sobrancelha")) {
+      topic = "sobrancelha";
+      label = "sobrancelha";
+      ambiguousTopic = false;
+      terms.add("sobrancelha");
+    }
+    if (normalized.contains("escova")) {
+      topic = "escova";
+      label = "escova";
+      ambiguousTopic = false;
+      terms.add("escova");
+    }
+    if (normalized.contains("progressiva")) {
+      topic = "progressiva";
+      label = "progressiva";
+      ambiguousTopic = false;
+      terms.add("progressiva");
+    }
+    if (normalized.contains("hidratacao") || normalized.contains("hidratar")) {
+      topic = "hidratacao";
+      label = "hidratacao";
+      ambiguousTopic = false;
+      terms.add("hidratacao");
+      terms.add("capilar");
+    }
+    if (normalized.contains("botox")) {
+      topic = "botox";
+      label = "botox capilar";
+      ambiguousTopic = false;
+      terms.add("botox");
+      terms.add("capilar");
+    }
+    if (normalized.contains("coloracao") || normalized.contains("colorir")
+        || normalized.contains("pintar") || normalized.contains("tintura")) {
+      topic = "coloracao";
+      label = "coloracao";
+      ambiguousTopic = false;
+      terms.add("coloracao");
+      terms.add("raiz");
+      terms.add("tinta");
+    }
+    if (normalized.contains("mechas")) {
+      topic = "mechas";
+      label = "mechas";
+      ambiguousTopic = false;
+      terms.add("mechas");
+    }
+    if (normalized.contains("luzes")) {
+      topic = "luzes";
+      label = "luzes";
+      ambiguousTopic = false;
+      terms.add("luzes");
+    }
+    if (normalized.contains("cabelo") || normalized.contains("capilar")) {
+      if (label.isBlank()) {
+        label = "cabelo";
+        ambiguousTopic = true;
+      }
+      if (topic.equals(normalized)) topic = "cabelo";
+      terms.add("cabelo");
+      terms.add("capilar");
+      if ("cabelo".equals(label)) {
+        terms.add("corte");
+        terms.add("escova");
+        terms.add("coloracao");
+        terms.add("hidratacao");
+        terms.add("progressiva");
+      }
+    }
+    if (normalized.contains("noiva") || normalized.contains("casamento")) {
+      if (label.isBlank()) label = "noiva";
+      if (topic.equals(normalized)) topic = "noiva";
+      terms.add("noiva");
+      terms.add("penteado");
+      terms.add("maquiagem");
+    }
+
+    if (label.isBlank()) {
+      label = topic.equals(normalized) ? "" : topic;
+    }
+    return new ServiceIntentContext(normalized, TextNormalizer.normalize(topic), label, List.copyOf(terms), ambiguousTopic);
+  }
+
+  private int scoreTokenSimilarity(String candidateToken, List<String> serviceTokens, int exactWeight) {
+    if (candidateToken == null || candidateToken.isBlank() || serviceTokens.isEmpty()) return 0;
+
+    String normalizedCandidateToken = normalizeToken(candidateToken);
+    int best = 0;
+    for (String serviceToken : serviceTokens) {
+      String normalizedServiceToken = normalizeToken(serviceToken);
+      if (normalizedServiceToken.isBlank()) continue;
+
+      if (normalizedServiceToken.equals(normalizedCandidateToken)) {
+        best = Math.max(best, exactWeight);
+        continue;
+      }
+      if (normalizedServiceToken.contains(normalizedCandidateToken) || normalizedCandidateToken.contains(normalizedServiceToken)) {
+        best = Math.max(best, Math.max(8, exactWeight - 14));
+        continue;
+      }
+
+      double similarity = tokenSimilarity(normalizedCandidateToken, normalizedServiceToken);
+      if (similarity >= 0.92d) {
+        best = Math.max(best, Math.max(10, exactWeight - 8));
+      } else if (similarity >= 0.80d) {
+        best = Math.max(best, Math.max(7, exactWeight - 18));
+      } else if (similarity >= 0.70d) {
+        best = Math.max(best, Math.max(4, exactWeight - 26));
+      }
+    }
+    return best;
+  }
+
+  private List<String> meaningfulTokens(String normalized) {
+    if (normalized == null || normalized.isBlank()) return List.of();
+    return Arrays.stream(normalized.split("[^a-z0-9]+"))
+        .map(String::trim)
+        .filter(token -> !token.isBlank())
+        .filter(token -> !SERVICE_INTENT_STOP_WORDS.contains(token))
+        .map(this::normalizeToken)
+        .filter(token -> !token.isBlank())
+        .distinct()
+        .toList();
+  }
+
+  private String normalizeToken(String token) {
+    if (token == null) return "";
+    String normalized = TextNormalizer.normalize(token).replaceAll("[^a-z0-9]", "");
+    if (normalized.length() > 4 && normalized.endsWith("oes")) {
+      normalized = normalized.substring(0, normalized.length() - 3) + "ao";
+    } else if (normalized.length() > 4 && normalized.endsWith("ais")) {
+      normalized = normalized.substring(0, normalized.length() - 3) + "al";
+    } else if (normalized.length() > 4 && normalized.endsWith("eis")) {
+      normalized = normalized.substring(0, normalized.length() - 3) + "el";
+    } else if (normalized.length() > 4 && normalized.endsWith("s")) {
+      normalized = normalized.substring(0, normalized.length() - 1);
+    }
+
+    if (normalized.endsWith("r") && normalized.length() > 5) {
+      normalized = normalized.substring(0, normalized.length() - 1);
+    }
+    if (normalized.endsWith("ndo") && normalized.length() > 6) {
+      normalized = normalized.substring(0, normalized.length() - 3);
+    }
+    return normalized;
+  }
+
+  private double tokenSimilarity(String left, String right) {
+    if (left.equals(right)) return 1.0d;
+    int maxLength = Math.max(left.length(), right.length());
+    if (maxLength == 0) return 1.0d;
+    return 1.0d - ((double) levenshteinDistance(left, right) / (double) maxLength);
+  }
+
+  private int levenshteinDistance(String left, String right) {
+    int[] previous = new int[right.length() + 1];
+    int[] current = new int[right.length() + 1];
+
+    for (int j = 0; j <= right.length(); j++) {
+      previous[j] = j;
+    }
+
+    for (int i = 1; i <= left.length(); i++) {
+      current[0] = i;
+      for (int j = 1; j <= right.length(); j++) {
+        int substitutionCost = left.charAt(i - 1) == right.charAt(j - 1) ? 0 : 1;
+        current[j] = Math.min(
+            Math.min(current[j - 1] + 1, previous[j] + 1),
+            previous[j - 1] + substitutionCost);
+      }
+
+      int[] swap = previous;
+      previous = current;
+      current = swap;
+    }
+
+    return previous[right.length()];
+  }
+
+  private static final class ServiceIntentContext {
+    private final String normalizedCandidate;
+    private final String normalizedTopic;
+    private final String humanLabel;
+    private final List<String> searchTerms;
+    private final boolean ambiguousTopic;
+
+    private ServiceIntentContext(String normalizedCandidate, String normalizedTopic, String humanLabel, List<String> searchTerms, boolean ambiguousTopic) {
+      this.normalizedCandidate = normalizedCandidate;
+      this.normalizedTopic = normalizedTopic;
+      this.humanLabel = humanLabel;
+      this.searchTerms = searchTerms;
+      this.ambiguousTopic = ambiguousTopic;
+    }
+
+    private String normalizedCandidate() { return normalizedCandidate; }
+    private String normalizedTopic() { return normalizedTopic; }
+    private String humanLabel() { return humanLabel; }
+    private List<String> searchTerms() { return searchTerms; }
+    private boolean ambiguousTopic() { return ambiguousTopic; }
+  }
+
+  private static final class ScoredServiceMatch {
+    private final ServicoDto service;
+    private final int score;
+
+    private ScoredServiceMatch(ServicoDto service, int score) {
+      this.service = service;
+      this.score = score;
+    }
+
+    private ServicoDto service() { return service; }
+    private int score() { return score; }
   }
 
   private boolean isPhone(String identifier) {
