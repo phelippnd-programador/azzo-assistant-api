@@ -1,7 +1,9 @@
 package br.com.phdigitalcode.azzo.assistant.application.service;
 
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -43,6 +45,7 @@ public class AssistantDomainService {
   private static final String CHANNEL_ASSISTANT_CONFIRMATION = "ASSISTANT_CONFIRMATION";
   private static final String CHANNEL_ASSISTANT_CANCELLATION = "ASSISTANT_CANCELLATION";
   private static final String STATUS_NOTIF_SENT = "SENT";
+  private static final ZoneId DEFAULT_ZONE = ZoneId.of("America/Sao_Paulo");
   private static final Set<String> SERVICE_INTENT_STOP_WORDS = Set.of(
       "quero", "queria", "gostaria", "preciso", "precisar", "fazer", "fazeria", "algo",
       "servico", "servicos", "atendimento", "trabalho", "trabalhar", "agendar", "marcar",
@@ -386,9 +389,10 @@ public class AssistantDomainService {
     if (client == null || client.id == null) return List.of();
 
     int normalizedLimit = Math.max(1, Math.min(limit, 20));
+    int fetchLimit = Math.max(20, normalizedLimit * 5);
     List<AgendamentoDto> appointments;
     try {
-      appointments = agendaProClient.listarAgendamentosCliente(client.id, tenantId, normalizedLimit);
+      appointments = agendaProClient.listarAgendamentosCliente(client.id, tenantId, fetchLimit);
     } catch (RuntimeException ignored) {
       return List.of();
     }
@@ -399,6 +403,9 @@ public class AssistantDomainService {
 
     List<UpcomingAppointmentOption> options = new ArrayList<>();
     for (AgendamentoDto ag : appointments) {
+      if (!isUpcomingAppointment(ag)) {
+        continue;
+      }
       String serviceName = services.stream()
           .filter(s -> s.id.equals(ag.serviceId))
           .map(s -> s.name)
@@ -417,10 +424,13 @@ public class AssistantDomainService {
       option.serviceName = serviceName;
       option.professionalName = professionalName;
       option.date = LocalDate.parse(ag.date);
-      option.time = ag.startTime;
+      option.time = normalizeAppointmentTime(ag.startTime);
       options.add(option);
     }
-    return options;
+    return options.stream()
+        .sorted(Comparator.comparing((UpcomingAppointmentOption item) -> LocalDateTime.of(item.date, LocalTime.parse(item.time))))
+        .limit(normalizedLimit)
+        .toList();
   }
 
   public Optional<UpcomingAppointmentOption> findUpcomingOptionForUser(String tenantId, String userIdentifier, UUID appointmentId) {
@@ -825,6 +835,30 @@ public class AssistantDomainService {
 
   private boolean isPhone(String identifier) {
     return normalizeDigits(identifier).length() >= 10;
+  }
+
+  private boolean isUpcomingAppointment(AgendamentoDto appointment) {
+    if (appointment == null || appointment.date == null || appointment.startTime == null) return false;
+    if (appointment.status == null || STATUS_CANCELLED.equalsIgnoreCase(appointment.status)) return false;
+    if (!STATUS_PENDING.equalsIgnoreCase(appointment.status) && !STATUS_CONFIRMED.equalsIgnoreCase(appointment.status)) {
+      return false;
+    }
+
+    try {
+      LocalDateTime appointmentDateTime = LocalDateTime.of(
+          LocalDate.parse(appointment.date),
+          LocalTime.parse(normalizeAppointmentTime(appointment.startTime)));
+      return appointmentDateTime.isAfter(LocalDateTime.now(DEFAULT_ZONE));
+    } catch (RuntimeException e) {
+      LOG.warnf("[AssistantDomainService] Ignorando agendamento invalido na listagem futura: id=%s erro=%s",
+          appointment.id, e.getMessage());
+      return false;
+    }
+  }
+
+  private String normalizeAppointmentTime(String time) {
+    if (time == null || time.isBlank()) return "";
+    return time.length() <= 5 ? time : time.substring(0, 5);
   }
 
   private String normalizeDigits(String value) {
