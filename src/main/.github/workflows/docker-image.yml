@@ -3,9 +3,8 @@ name: Build and Push Quarkus Image
 on:
   push:
     branches:
-      - main
+      - develop
       - master
-      - homologacao
     tags:
       - "v*"
 
