@@ -711,7 +711,11 @@ public class AssistantConversationService {
     }
     if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.CANCEL
         && data.stage != ConversationStage.ASK_CANCEL_APPOINTMENT
-        && data.stage != ConversationStage.ASK_RESCHEDULE_APPOINTMENT) {
+        && data.stage != ConversationStage.ASK_RESCHEDULE_APPOINTMENT
+        && data.stage != ConversationStage.ASK_DATE
+        && data.stage != ConversationStage.ASK_PERIOD
+        && data.stage != ConversationStage.ASK_TIME
+        && data.stage != ConversationStage.CONFIRMATION) {
       if (!domainService.canCancelViaWhatsApp(tenantId)) {
         return "Esse salão não permite cancelamentos pelo WhatsApp agora. 😕";
       }
@@ -719,7 +723,11 @@ public class AssistantConversationService {
     }
     if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.RESCHEDULE
         && data.stage != ConversationStage.ASK_CANCEL_APPOINTMENT
-        && data.stage != ConversationStage.ASK_RESCHEDULE_APPOINTMENT) {
+        && data.stage != ConversationStage.ASK_RESCHEDULE_APPOINTMENT
+        && data.stage != ConversationStage.ASK_DATE
+        && data.stage != ConversationStage.ASK_PERIOD
+        && data.stage != ConversationStage.ASK_TIME
+        && data.stage != ConversationStage.CONFIRMATION) {
       if (!domainService.canRescheduleViaWhatsApp(tenantId)) {
         return "Esse salão não permite remarcações pelo WhatsApp agora. 😕";
       }

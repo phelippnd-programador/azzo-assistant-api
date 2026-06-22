@@ -598,12 +598,12 @@ public class AssistantDomainService {
     terms.add(normalized);
     terms.addAll(meaningfulTokens(normalized));
 
-    if ((normalized.contains("cortar") || normalized.contains("corte")) && normalized.contains("cabelo")) {
+    if (normalized.contains("cortar") || normalized.contains("corte")) {
       topic = "corte";
       label = "corte";
       ambiguousTopic = false;
       terms.add("corte");
-      terms.add("cabelo");
+      if (normalized.contains("cabelo")) terms.add("cabelo");
     }
     if (normalized.contains("barba") || normalized.contains("barbear")) {
       topic = "barba";
