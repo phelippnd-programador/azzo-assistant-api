@@ -146,10 +146,15 @@ public class LlmBookingAgent {
 
     // ─── Tipos públicos ───────────────────────────────────────────────────────
 
-    public record AgentResult(String text, List<AgentAction> actions, String providerUsed) {
+    public record AgentResult(String text, List<AgentAction> actions, String providerUsed, boolean llmUnavailable) {
 
         public static AgentResult fallback(String message, String provider) {
-            return new AgentResult(message, List.of(), provider);
+            return new AgentResult(message, List.of(), provider, true);
+        }
+
+        // Convenience constructor for successful responses
+        public AgentResult(String text, List<AgentAction> actions, String providerUsed) {
+            this(text, actions, providerUsed, false);
         }
 
         public boolean hasAction(String type) {

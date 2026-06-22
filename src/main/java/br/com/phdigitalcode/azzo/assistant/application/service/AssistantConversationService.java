@@ -270,6 +270,12 @@ public class AssistantConversationService {
       }
     }
 
+    // LLM completamente indisponível (Groq + Ollama falharam) → cai para máquina de estados
+    if (result.llmUnavailable()) {
+      LOG.warnf("[Agent] LLM indisponível — usando fallback determinístico para tenantId=%s", tenantId);
+      return handleMessage(data, rawMessage, userIdentifier, tenantId);
+    }
+
     // Processa ações — max 1 round-trip para evitar loops
     String finalReply = processActions(result, data, userIdentifier, tenantId, systemPrompt);
 
