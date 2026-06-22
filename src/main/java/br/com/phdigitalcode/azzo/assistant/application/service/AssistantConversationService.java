@@ -709,13 +709,17 @@ public class AssistantConversationService {
       data.stage = ConversationStage.START;
       return domainService.listUpcomingForUser(tenantId, userIdentifier);
     }
-    if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.CANCEL) {
+    if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.CANCEL
+        && data.stage != ConversationStage.ASK_CANCEL_APPOINTMENT
+        && data.stage != ConversationStage.ASK_RESCHEDULE_APPOINTMENT) {
       if (!domainService.canCancelViaWhatsApp(tenantId)) {
         return "Esse salão não permite cancelamentos pelo WhatsApp agora. 😕";
       }
       return iniciarFluxoCancelamento(data, userIdentifier, tenantId);
     }
-    if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.RESCHEDULE) {
+    if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.RESCHEDULE
+        && data.stage != ConversationStage.ASK_CANCEL_APPOINTMENT
+        && data.stage != ConversationStage.ASK_RESCHEDULE_APPOINTMENT) {
       if (!domainService.canRescheduleViaWhatsApp(tenantId)) {
         return "Esse salão não permite remarcações pelo WhatsApp agora. 😕";
       }
@@ -814,8 +818,22 @@ public class AssistantConversationService {
     }
 
     if (data.serviceId == null) {
-      Optional<String> extracted = serviceNameFinder.extractFirst(rawMessage);
-      Optional<ServicoDto> resolved = extracted.flatMap(n -> domainService.resolveService(tenantId, n));
+      // Resolução por ordinal: "1", "2", etc. seleciona da lista de serviços
+      Optional<ServicoDto> resolvedByOrdinal = Optional.empty();
+      try {
+        int ordinal = Integer.parseInt(normalized.strip());
+        if (ordinal >= 1) {
+          List<ServicoDto> allServices = domainService.listServices(tenantId);
+          if (ordinal <= allServices.size()) {
+            resolvedByOrdinal = Optional.of(allServices.get(ordinal - 1));
+          }
+        }
+      } catch (NumberFormatException ignored) {}
+
+      Optional<String> extracted = resolvedByOrdinal.isPresent()
+          ? Optional.empty() : serviceNameFinder.extractFirst(rawMessage);
+      Optional<ServicoDto> resolved = resolvedByOrdinal.isPresent()
+          ? resolvedByOrdinal : extracted.flatMap(n -> domainService.resolveService(tenantId, n));
       if (resolved.isEmpty()) {
         resolved = domainService.resolveService(tenantId, rawMessage);
       }
@@ -1818,17 +1836,19 @@ public class AssistantConversationService {
     if (intentPrediction.intent == IntentType.GREETING) return null;
     if (intentPrediction.intent != IntentType.UNKNOWN && intentPrediction.confidence >= minIntentConfidence) return null;
 
-    // Stages onde o usuário preenche slot literal: deixar a lógica de resolução tentar.
-    // Se falhar, cada stage já tem sua própria mensagem de reprompt (serviços, profissionais, etc.)
+    // Stages onde o usuário preenche slot literal OU tem handler próprio:
+    // deixar a lógica específica do stage agir em vez do menu genérico.
     if (data.stage == ConversationStage.ASK_DATE
         || data.stage == ConversationStage.ASK_PERIOD
         || data.stage == ConversationStage.ASK_TIME
         || data.stage == ConversationStage.ASK_NAME
         || data.stage == ConversationStage.ASK_SERVICE
         || data.stage == ConversationStage.ASK_PROFESSIONAL
+        || data.stage == ConversationStage.ASK_CANCEL_APPOINTMENT
+        || data.stage == ConversationStage.ASK_RESCHEDULE_APPOINTMENT
         || data.stage == ConversationStage.CONFIRMATION) return null;
 
-    // START / COMPLETED / cancel / reschedule stages: menu global faz sentido
+    // START / COMPLETED: menu global faz sentido
     return "Não entendi direito. O que você quer? 😊\n1 - Agendar\n2 - Remarcar\n3 - Cancelar\n4 - Ver meus agendamentos";
   }
 
@@ -2391,7 +2411,9 @@ public class AssistantConversationService {
     }
 
     LocalDate resolvedDate = DateTimeRegexExtractor.extractDate(rawMessage).orElse(null);
-    String resolvedTime = DateTimeRegexExtractor.extractTime(rawMessage).map(this::normalizeTime).orElse(null);
+    // extractTimeStrict requer HH:MM explícito — evita falsos positivos com ordinais ("1" → "01:00")
+    // e com dígitos de datas ("30/06" → "06:00")
+    String resolvedTime = DateTimeRegexExtractor.extractTimeStrict(rawMessage).map(this::normalizeTime).orElse(null);
 
     signals.date = resolvedDate != null ? resolvedDate.toString() : null;
     signals.time = resolvedTime;

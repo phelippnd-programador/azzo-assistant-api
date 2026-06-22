@@ -13,6 +13,8 @@ public final class DateTimeRegexExtractor {
   private static final Pattern DATE_DMY = Pattern.compile("\\b(\\d{1,2})[/-](\\d{1,2})(?:[/-](\\d{2,4}))?\\b");
   private static final Pattern DATE_YMD = Pattern.compile("\\b(\\d{4})-(\\d{2})-(\\d{2})\\b");
   private static final Pattern TIME = Pattern.compile("\\b([01]?\\d|2[0-3])(?:[:h]([0-5]\\d))?\\b");
+  // Exige HH:MM (ou HHhMM) — sem isso não aceita bare ordinal como "1" ou dígito de data como "06"
+  private static final Pattern TIME_STRICT = Pattern.compile("\\b([01]?\\d|2[0-3])[:h]([0-5]\\d)\\b");
 
   private DateTimeRegexExtractor() {}
 
@@ -51,6 +53,24 @@ public final class DateTimeRegexExtractor {
 
     int hour = Integer.parseInt(matcher.group(1));
     int minute = matcher.group(2) == null ? 0 : Integer.parseInt(matcher.group(2));
+    try {
+      return Optional.of(LocalTime.of(hour, minute).toString());
+    } catch (RuntimeException ignored) {
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * Extrai horário apenas quando o formato HH:MM ou HHhMM está explícito.
+   * Use para contextos onde o texto pode conter números que não são horários
+   * (datas, ordinais de seleção, etc.) para evitar falsos positivos.
+   */
+  public static Optional<String> extractTimeStrict(String text) {
+    Matcher matcher = TIME_STRICT.matcher(TextNormalizer.normalize(text));
+    if (!matcher.find()) return Optional.empty();
+
+    int hour = Integer.parseInt(matcher.group(1));
+    int minute = Integer.parseInt(matcher.group(2));
     try {
       return Optional.of(LocalTime.of(hour, minute).toString());
     } catch (RuntimeException ignored) {
