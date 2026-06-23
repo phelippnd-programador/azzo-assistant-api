@@ -1000,9 +1000,28 @@ public class AssistantConversationService {
         data.availableTimeOptions = new ArrayList<>(domainService.suggestTimes(tenantId, data.professionalId, data.date, data.serviceId, data.preferredPeriod));
       }
       if (data.availableTimeOptions.isEmpty()) {
+        // "1", "2", "3" → manhã/tarde/noite quando não há slots no período atual
+        String trimmedNorm = normalized.strip();
+        TimePeriod periodByNumber = switch (trimmedNorm) {
+          case "1" -> TimePeriod.MORNING;
+          case "2" -> TimePeriod.AFTERNOON;
+          case "3" -> TimePeriod.NIGHT;
+          default  -> null;
+        };
+        if (periodByNumber != null && periodByNumber != data.preferredPeriod) {
+          data.preferredPeriod = periodByNumber;
+          data.availableTimeOptions.clear();
+          data.availableTimeOptions = new ArrayList<>(domainService.suggestTimes(tenantId, data.professionalId, data.date, data.serviceId, data.preferredPeriod));
+          if (!data.availableTimeOptions.isEmpty()) {
+            data.stage = ConversationStage.ASK_TIME;
+            return "Qual horário de " + preferredPeriodLabel(data) + " fica bom? Escolha pelo número:\n"
+                + buildNumberedTimeList(data.availableTimeOptions)
+                + "\nOu fala outro período ou \"trocar dia\". 😊";
+          }
+        }
         data.stage = ConversationStage.ASK_TIME;
         return "Não tem horário vago de " + preferredPeriodLabel(data)
-            + " nessa data. 😕 Quer tentar outro período (manhã/tarde/noite) ou mudar o dia?";
+            + " nessa data. 😕 Quer tentar outro período (1-manhã / 2-tarde / 3-noite) ou manda \"trocar dia\".";
       }
 
       OptionalInt index = parseOrdinalSelection(rawMessage, data.availableTimeOptions.size());
@@ -1338,6 +1357,16 @@ public class AssistantConversationService {
     }
     if (normalized.matches("^\\d+$")) {
       int index = Integer.parseInt(normalized) - 1;
+      if (index >= 0 && index < optionSize) {
+        return OptionalInt.of(index);
+      }
+    }
+    // Extrai número isolado no final ou precedido por artigo/preposição ("o 2", "fica o 1", "numero 3")
+    java.util.regex.Matcher m = java.util.regex.Pattern
+        .compile("(?:^|\\s)(?:o|a|numero|opcao|opcão|item)?\\s*(\\d+)\\s*$")
+        .matcher(normalized);
+    if (m.find()) {
+      int index = Integer.parseInt(m.group(1)) - 1;
       if (index >= 0 && index < optionSize) {
         return OptionalInt.of(index);
       }
