@@ -28,11 +28,15 @@ import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.MediaType;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.jboss.logging.Logger;
 
 @Path("/api/v1/assistant")
 @Consumes(MediaType.APPLICATION_JSON)
 @Produces(MediaType.APPLICATION_JSON)
 public class AssistantResource {
+
+  private static final Logger LOG = Logger.getLogger(AssistantResource.class);
 
   @Inject AssistantConversationService conversationService;
   @Inject OpenNLPModelTrainer modelTrainer;
@@ -41,12 +45,21 @@ public class AssistantResource {
   @Inject AgentSystemPromptBuilder agentSystemPromptBuilder;
   @Inject ConversationStateManager stateManager;
 
+  @ConfigProperty(name = "app.assistant.debug", defaultValue = "false")
+  boolean debugEnabled;
+
   @POST
   @Path("/message")
   public AssistantMessageResponse message(
       @Valid AssistantMessageRequest request,
       @HeaderParam("X-User-Identifier") String userIdentifier,
       @HeaderParam("X-User-Name") String userName) {
+    if (debugEnabled) {
+      LOG.infof("assistant.message.received userIdentifier=%s messageLength=%d message=%s",
+          userIdentifier,
+          request.message != null ? request.message.length() : 0,
+          request.message);
+    }
     return conversationService.process(request.message, userIdentifier, userName);
   }
 
