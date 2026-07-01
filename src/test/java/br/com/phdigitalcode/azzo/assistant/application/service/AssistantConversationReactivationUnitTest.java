@@ -84,7 +84,7 @@ class AssistantConversationReactivationUnitTest {
         AssistantMessageResponse response = service.process("sim", USER_ID, USER_NAME);
 
         assertNotNull(response);
-        assertEquals(ConversationStage.ASK_SERVICE.name(), response.stage);
+        assertEquals(ConversationStage.ASK_SERVICE, response.stage);
         assertTrue(response.reply.toLowerCase().contains("retomar"));
         assertTrue(response.reply.toLowerCase().contains("servico"));
     }
@@ -102,7 +102,7 @@ class AssistantConversationReactivationUnitTest {
         AssistantMessageResponse response = service.process("nao quero", USER_ID, USER_NAME);
 
         assertNotNull(response);
-        assertEquals(ConversationStage.START.name(), response.stage);
+        assertEquals(ConversationStage.START, response.stage);
         assertTrue(response.reply.toLowerCase().contains("tudo certo"));
     }
 
@@ -129,7 +129,7 @@ class AssistantConversationReactivationUnitTest {
                 USER_ID,
                 null);
 
-        assertEquals(ConversationStage.ASK_NAME.name(), response.stage);
+        assertEquals(ConversationStage.ASK_NAME, response.stage);
         assertEquals(Boolean.TRUE, response.slots.get("bookingLeadDetected"));
         assertEquals(corte.id, response.slots.get("bookingLeadServiceId"));
         assertEquals("Corte", response.slots.get("bookingLeadServiceName"));

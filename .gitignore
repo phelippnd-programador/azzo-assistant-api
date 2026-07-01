@@ -2,6 +2,8 @@
 privateKey.pem
 publicKey.pem
 .env
+.env.*
+!.env.example
 
 # IDE
 /.idea/

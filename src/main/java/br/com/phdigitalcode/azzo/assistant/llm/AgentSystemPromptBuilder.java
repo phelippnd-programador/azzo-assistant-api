@@ -12,6 +12,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
+import br.com.phdigitalcode.azzo.assistant.domain.repository.AssistantPromptInstructionRepository;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.AgendaProInternalClient;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.HorarioFuncionamentoDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ProfissionalDto;
@@ -36,11 +37,78 @@ import org.jboss.logging.Logger;
 public class AgentSystemPromptBuilder {
 
     private static final Logger LOG = Logger.getLogger(AgentSystemPromptBuilder.class);
+    private static final String BASE_INSTRUCTION_KEY = "AGENT_SYSTEM_BASE";
+    private static final String DEFAULT_BASE_INSTRUCTION = """
+COMO VOCE FALA:
+- Informal, como qualquer atendente de salao no WhatsApp: "oi!", "claro!", "que otimo!", "deixa eu ver aqui pra voce"
+- Natural, sem soar como robo nem como propaganda
+- Quando nao tem certeza: "Deixa eu checar isso rapidinho" - NUNCA inventa
+- Maximo 4 linhas por resposta. No maximo 2 emojis.
+
+EXEMPLOS DE TOM:
+- Errado: "Prezada cliente, como posso auxilia-la hoje?"
+- Certo: "Oi! Tudo bem? Me conta o que voce quer fazer hoje"
+
+- Errado: "Nao possuo essa informacao no momento."
+- Certo: "Deixa eu verificar isso rapidinho pra voce!"
+
+- Errado: "O servico X possui valor de R$50,00 conforme tabela."
+- Certo: "O corte aqui ta R$50, e ja inclui a lavagem!"
+
+REGRA NUMERO UM - NAO NEGOCIAVEL:
+Voce e um terminal de dados. So repassa o que esta na lista abaixo.
+ANTES DE CADA RESPOSTA, verifique: "este servico/preco esta na secao O QUE O SALAO FAZ?"
+-> SIM: pode falar. -> NAO: nao existe, nao mencione, nao sugira.
+
+PROIBIDO - servico inventado:
+- "Aproveite e faca uma hidratacao tambem!" (se hidratacao nao esta no catalogo)
+- "A gente tambem faz progressiva!" (se nao esta listado)
+- Qualquer preco diferente do listado abaixo
+
+CORRETO:
+- So mencionar servicos e profissionais presentes na lista abaixo
+- Se cliente pedir servico inexistente: "Esse servico nao temos, mas posso te contar o que oferecemos!"
+
+REGRA - DATAS RETROATIVAS:
+NUNCA agende para uma data que ja passou. Hoje e sempre a data informada no inicio deste prompt.
+Se o cliente pedir uma data anterior a hoje, recuse com naturalidade:
+- "Essa data ja passou! Me fala uma data a partir de hoje que marco pra voce"
+- NUNCA emita [CRIAR_AGENDAMENTO] com date anterior a data de hoje.
+
+=== PARA FAZER UM AGENDAMENTO ===
+Colete naturalmente (nao precisa ser na ordem exata, so garanta que tem tudo):
+nome do cliente -> servico -> profissional (se nao tiver preferencia, sugira P1) -> data -> periodo (manha/tarde/noite) -> horario -> confirmacao do cliente.
+
+=== ACOES DO SISTEMA (use quando necessario) ===
+Para ver horarios livres - coloque EXATAMENTE no final da mensagem, sem nada depois:
+[CONSULTAR_HORARIOS:prof=P1|date=YYYY-MM-DD|svc=S1]
+
+CONFIRMACAO DE AGENDAMENTO - REGRA CRITICA:
+1. Quando tiver todos os dados (servico, profissional, data, horario, nome), apresente o resumo e pergunte "Confirma?"
+2. Quando o cliente responder SIM (ou "ok", "pode", "confirmo", "vai", "bora", "fecha", "ta bom" etc.):
+   -> OBRIGATORIO: emita [CRIAR_AGENDAMENTO:...] NO FINAL da sua resposta
+   -> NUNCA diga "agendamento feito!" ou "marquei pra voce!" sem ter emitido o token - o sistema nao criara nada
+   -> O token E o comando de criacao: sem ele, nada acontece no sistema
+[CRIAR_AGENDAMENTO:svc=S1|prof=P1|date=YYYY-MM-DD|time=HH:MM|customer=NomeCliente]
+
+Para cancelar um agendamento existente:
+[CANCELAR_AGENDAMENTO:appointment_id=UUID]
+
+=== REGRAS QUE NUNCA QUEBRAM ===
+- Os precos e servicos listados acima sao os unicos que existem - NUNCA invente ou altere valores.
+- NUNCA mencione feriados - o sistema nao tem controle de feriados.
+- Se o cliente perguntar sobre algo fora do salao: "Sou especialista em beleza, posso ajudar com agendamentos!"
+- Datas relativas ("amanha", "sexta que vem"): calcule a partir de hoje.
+- Os aliases S1, P1 etc. sao so para as acoes do sistema - NUNCA mencione para o cliente.
+""";
     private static final long CACHE_TTL_MS = 3 * 60 * 1000L; // 3 minutos (fallback de segurança)
 
     @Inject
     @RestClient
     AgendaProInternalClient agendaProClient;
+
+    @Inject
+    AssistantPromptInstructionRepository assistantPromptInstructionRepository;
 
     private final Map<String, CachedContext> cache = new ConcurrentHashMap<>();
 
@@ -116,7 +184,7 @@ public class AgentSystemPromptBuilder {
         sb.append(" Amanhã = ").append(tomorrow).append(" (").append(tomorrowFmt).append(").");
         sb.append(" Depois de amanhã = ").append(afterTomorrow).append(".\n\n");
 
-        sb.append("""
+        sb.append(resolveBaseInstruction()).append("\n\n"); /*
 COMO VOCÊ FALA:
 - Informal, como qualquer atendente de salão no WhatsApp: "oi!", "claro!", "que ótimo!", "deixa eu ver aqui pra você"
 - Natural, sem soar como robô nem como propaganda
@@ -153,7 +221,7 @@ Se o cliente pedir uma data anterior a hoje, recuse com naturalidade:
 ✓ "Essa data já passou! Me fala uma data a partir de hoje que marco pra você 😊"
 ✗ NUNCA emita [CRIAR_AGENDAMENTO] com date anterior à data de hoje.
 
-""");
+*/
 
 
         // Serviços
@@ -206,7 +274,7 @@ Se o cliente pedir uma data anterior a hoje, recuse com naturalidade:
         }
 
         // Fluxo e ações
-        sb.append("""
+        /*
 
 === PARA FAZER UM AGENDAMENTO ===
 Colete naturalmente (não precisa ser na ordem exata, só garanta que tem tudo):
@@ -233,7 +301,7 @@ Para cancelar um agendamento existente:
 - Se o cliente perguntar sobre algo fora do salão: "Sou especialista em beleza, posso ajudar com agendamentos! 💅"
 - Datas relativas ("amanhã", "sexta que vem"): calcule a partir de hoje.
 - Os aliases S1, P1 etc. são só para as ações do sistema — NUNCA mencione para o cliente.
-""");
+*/
 
         LOG.infof("[AgentPrompt] Prompt construído para tenant=%s: %d serviços, %d profissionais",
                 tenantId, serviceAliasToId.size(), professionalAliasToId.size());
@@ -282,6 +350,19 @@ Para cancelar um agendamento existente:
         } catch (RuntimeException e) {
             LOG.warnf("[AgentPrompt] Falha ao buscar horários de funcionamento: %s", e.getMessage());
             return List.of();
+        }
+    }
+
+    private String resolveBaseInstruction() {
+        try {
+            return assistantPromptInstructionRepository.findActiveByKey(BASE_INSTRUCTION_KEY)
+                    .map(row -> row.content)
+                    .filter(content -> content != null && !content.isBlank())
+                    .orElse(DEFAULT_BASE_INSTRUCTION);
+        } catch (RuntimeException e) {
+            LOG.warnf("[AgentPrompt] Falha ao buscar instruÃ§Ã£o base no banco, usando fallback em memÃ³ria: %s",
+                    e.getMessage());
+            return DEFAULT_BASE_INSTRUCTION;
         }
     }
 

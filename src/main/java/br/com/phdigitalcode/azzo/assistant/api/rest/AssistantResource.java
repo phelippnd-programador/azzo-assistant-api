@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
+import java.time.Instant;
 
 import br.com.phdigitalcode.azzo.assistant.application.service.AssistantConversationService;
 import br.com.phdigitalcode.azzo.assistant.application.service.ConversationStateManager;
@@ -28,11 +29,15 @@ import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.MediaType;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.jboss.logging.Logger;
 
 @Path("/api/v1/assistant")
 @Consumes(MediaType.APPLICATION_JSON)
 @Produces(MediaType.APPLICATION_JSON)
 public class AssistantResource {
+
+  private static final Logger LOG = Logger.getLogger(AssistantResource.class);
 
   @Inject AssistantConversationService conversationService;
   @Inject OpenNLPModelTrainer modelTrainer;
@@ -41,13 +46,49 @@ public class AssistantResource {
   @Inject AgentSystemPromptBuilder agentSystemPromptBuilder;
   @Inject ConversationStateManager stateManager;
 
+  @ConfigProperty(name = "app.assistant.debug", defaultValue = "false")
+  boolean debugEnabled;
+
   @POST
   @Path("/message")
   public AssistantMessageResponse message(
       @Valid AssistantMessageRequest request,
+      @HeaderParam("X-Tenant-Id") String tenantId,
       @HeaderParam("X-User-Identifier") String userIdentifier,
       @HeaderParam("X-User-Name") String userName) {
-    return conversationService.process(request.message, userIdentifier, userName);
+    int msgLen = request.message != null ? request.message.length() : 0;
+    if (debugEnabled) {
+      LOG.debugf("assistant.flow.message.received tenantId=%s userIdentifier=%s messageLength=%d message=%s",
+          tenantId, userIdentifier, msgLen, request.message);
+    }
+
+    Instant start = debugEnabled ? Instant.now() : null;
+
+    if (debugEnabled) {
+      LOG.debugf("assistant.flow.service.calling tenantId=%s userIdentifier=%s messageLength=%d",
+          tenantId, userIdentifier, msgLen);
+    }
+
+    AssistantMessageResponse response = conversationService.process(request.message, userIdentifier, userName);
+
+    if (debugEnabled) {
+      long elapsedMs = java.time.Duration.between(start, Instant.now()).toMillis();
+      String replySnippet = response != null && response.reply != null
+          ? (response.reply.length() > 120 ? response.reply.substring(0, 120) + "..." : response.reply)
+          : "null";
+      LOG.debugf("assistant.flow.service.replied tenantId=%s userIdentifier=%s stage=%s replyLength=%d elapsedMs=%d reply=%s",
+          tenantId, userIdentifier,
+          response != null ? response.stage : "null",
+          response != null && response.reply != null ? response.reply.length() : 0,
+          elapsedMs,
+          replySnippet);
+      LOG.debugf("assistant.flow.response.sent tenantId=%s userIdentifier=%s stage=%s elapsedMs=%d",
+          tenantId, userIdentifier,
+          response != null ? response.stage : "null",
+          elapsedMs);
+    }
+
+    return response;
   }
 
   @POST

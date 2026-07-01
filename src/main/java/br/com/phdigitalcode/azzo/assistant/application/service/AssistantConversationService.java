@@ -6,9 +6,11 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.time.temporal.TemporalAdjusters;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -55,6 +57,8 @@ import org.jboss.logging.Logger;
 public class AssistantConversationService {
 
   private static final Logger LOG = Logger.getLogger(AssistantConversationService.class);
+  private static final DateTimeFormatter DATE_BR_FORMATTER = DateTimeFormatter.ofPattern("dd/MM/yyyy");
+  private static final Pattern CENTS_CURRENCY_PATTERN = Pattern.compile("R\\$(\\d{3,})\\b");
 
   @Inject OpenNLPIntentClassifier intentClassifier;
   @Inject OllamaIntentService ollamaIntentService;
@@ -71,8 +75,14 @@ public class AssistantConversationService {
   @Inject AgentSystemPromptBuilder agentSystemPromptBuilder;
   @Inject LlmBookingAgent llmBookingAgent;
 
-  @ConfigProperty(name = "assistant.conversation.ttl-minutes", defaultValue = "120")
+  @ConfigProperty(name = "assistant.conversation.ttl-minutes", defaultValue = "480")
   long ttlMinutes;
+  @ConfigProperty(name = "assistant.conversation.max-history-messages", defaultValue = "80")
+  int maxHistoryMessages;
+  @ConfigProperty(name = "assistant.conversation.keep-history-messages", defaultValue = "60")
+  int keepHistoryMessages;
+  @ConfigProperty(name = "assistant.conversation.max-history-chars", defaultValue = "3000")
+  int maxHistoryChars;
   @ConfigProperty(name = "assistant.greeting-zone", defaultValue = "America/Sao_Paulo")
   String greetingZone;
   @ConfigProperty(name = "assistant.intent.min-confidence", defaultValue = "0.62")
@@ -81,6 +91,10 @@ public class AssistantConversationService {
   double ollamaMinConfidence;
   @ConfigProperty(name = "assistant.agent.enabled", defaultValue = "false")
   boolean agentEnabled;
+  @ConfigProperty(name = "assistant.llm.max-input-chars", defaultValue = "1000")
+  int llmMaxInputChars;
+  @ConfigProperty(name = "assistant.llm.short-response-max-tokens", defaultValue = "48")
+  int shortResponseMaxTokens;
 
   // Sem @Transactional aqui — chamadas ao LLM (lentas) não podem segurar uma transação JTA aberta.
   // As operações de DB são delegadas ao ConversationStateManager que abre transações curtas.
@@ -113,6 +127,7 @@ public class AssistantConversationService {
     String reply = agentEnabled
         ? handleMessageAgent(data, rawMessage, userIdentifier, tenantIdStr)
         : handleMessage(data, rawMessage, userIdentifier, tenantIdStr);
+    reply = normalizeCurrencyDisplay(reply);
 
     // TX 2: persiste resultado (< 50ms)
     if (shouldDeleteConversationState(data)) {
@@ -123,7 +138,7 @@ public class AssistantConversationService {
 
     AssistantMessageResponse response = new AssistantMessageResponse();
     response.reply = reply;
-    response.stage = data.stage.name();
+    response.stage = data.stage;
     response.slots = new LinkedHashMap<>();
     response.slots.put("serviceId", data.serviceId);
     response.slots.put("serviceName", data.serviceName);
@@ -144,6 +159,7 @@ public class AssistantConversationService {
     response.slots.put("bookingLeadServiceName", bookingLead.serviceName);
     response.slots.put("bookingLeadDate", bookingLead.date);
     response.slots.put("bookingLeadTime", bookingLead.time);
+    response.slots.put("reactivationStage", deriveReactivationStage(data));
     response.slots.put("manualInterventionSuggested", data.manualInterventionSuggested);
     response.slots.put("manualInterventionReason", data.manualInterventionReason);
     response.slots.put("manualInterventionAttempts", data.manualInterventionAttempts);
@@ -156,6 +172,22 @@ public class AssistantConversationService {
    * Novo fluxo orientado a LLM: o modelo conduz toda a conversa com contexto
    * completo do salão. Java executa as ações detectadas nos action tokens.
    */
+  private String deriveReactivationStage(ConversationData data) {
+    if (data == null || data.stage == null) return null;
+
+    return switch (data.stage) {
+      case START, ASK_NAME, ASK_SERVICE -> "SERVICE_SELECTION";
+      case ASK_PROFESSIONAL -> "PROFESSIONAL_SELECTION";
+      case ASK_DATE, ASK_PERIOD, ASK_TIME -> "TIME_SELECTION";
+      case CONFIRMATION -> "FINAL_REVIEW";
+      case COMPLETED -> "COMPLETED";
+      case ASK_CANCEL_APPOINTMENT,
+          ASK_RESCHEDULE_APPOINTMENT,
+          AWAITING_APPOINTMENT_CONFIRMATION,
+          AWAITING_REACTIVATION_REPLY -> null;
+    };
+  }
+
   private String handleMessageAgent(ConversationData data, String rawMessage,
       String userIdentifier, String tenantId) {
 
@@ -178,21 +210,38 @@ public class AssistantConversationService {
       data.customerName = savedName; // mantém o nome para não precisar perguntar de novo
     }
 
+    String normalized = TextNormalizer.normalize(rawMessage);
+
+    if (isServiceCatalogQuery(normalized)) {
+      clearBookingFlow(data, tenantId);
+      data.stage = ConversationStage.ASK_SERVICE;
+      return domainService.formatServicesPromptForCustomer(tenantId, data.customerName);
+    }
+
     // Limita o histórico a 30 mensagens para não estourar o contexto do LLM
-    if (data.chatHistory.size() > 30) {
-      List<ChatMessage> kept = new ArrayList<>(data.chatHistory.subList(
-          Math.max(0, data.chatHistory.size() - 25), data.chatHistory.size()));
-      data.chatHistory.clear();
-      data.chatHistory.addAll(kept);
+    BookingLeadSignals bookingLead = detectBookingLeadSignals(rawMessage, data, tenantId);
+    applyBookingLeadSignals(data, bookingLead);
+    syncBookingStageFromKnownSlots(data);
+    trimChatHistory(data);
+    PreparedSlotContext preparedSlotContext = prepareAvailableSlotsForAgent(data, normalized, tenantId);
+    String shortcutReply = handleAgentDeterministicIntent(data, rawMessage, normalized, bookingLead, userIdentifier, tenantId);
+    if (shortcutReply != null) {
+      return shortcutReply;
     }
 
     // Resolve datas relativas em Java antes de enviar ao LLM (modelos 8B erram esse cálculo)
-    String enrichedMessage = enrichDatesInMessage(rawMessage);
+    String contextualMessage = contextualizeAgentSelection(data, rawMessage, normalized);
+    contextualMessage = appendBookingContextForAgent(data, contextualMessage, bookingLead);
+    contextualMessage = appendPreparedSlotsForAgent(contextualMessage, preparedSlotContext);
+    String enrichedMessage = enrichDatesInMessage(contextualMessage);
+    String compactedMessage = compactMessageForLlm(enrichedMessage);
+    LlmBookingAgent.AgentChatOptions chatOptions =
+        buildAgentChatOptions(data, rawMessage, tenantId, preparedSlotContext);
 
     String systemPrompt = agentSystemPromptBuilder.build(tenantId);
     // Passa activeProvider para sticky routing — null = nova conversa, router decide
     LlmBookingAgent.AgentResult result = llmBookingAgent.chat(
-        systemPrompt, data.chatHistory, enrichedMessage, data.activeProvider);
+        systemPrompt, data.chatHistory, compactedMessage, data.activeProvider, chatOptions);
 
     // Persiste o provider escolhido para manter sticky durante toda a conversa
     if (result.providerUsed() != null) {
@@ -206,7 +255,7 @@ public class AssistantConversationService {
         && isAffirmativeResponse(rawMessage)) {
       LOG.infof("[Agent] Confirmação detectada sem action token — re-chamando LLM com hint");
       List<ChatMessage> tempHistory = new ArrayList<>(data.chatHistory);
-      tempHistory.add(new ChatMessage("user", enrichedMessage));
+      tempHistory.add(new ChatMessage("user", compactedMessage));
       tempHistory.add(new ChatMessage("tool",
           "[Sistema: o cliente acabou de confirmar o agendamento. "
           + "Emita OBRIGATORIAMENTE [CRIAR_AGENDAMENTO:...] com todos os dados coletados na conversa. "
@@ -221,14 +270,77 @@ public class AssistantConversationService {
       }
     }
 
+    // LLM completamente indisponível (Groq + Ollama falharam) → cai para máquina de estados
+    if (result.llmUnavailable()) {
+      LOG.warnf("[Agent] LLM indisponível — usando fallback determinístico para tenantId=%s", tenantId);
+      return handleMessage(data, rawMessage, userIdentifier, tenantId);
+    }
+
     // Processa ações — max 1 round-trip para evitar loops
     String finalReply = processActions(result, data, userIdentifier, tenantId, systemPrompt);
 
     // Grava no histórico para próximos turnos (usa mensagem enriquecida para consistência)
-    data.chatHistory.add(new ChatMessage("user", enrichedMessage));
+    data.chatHistory.add(new ChatMessage("user", compactedMessage));
     data.chatHistory.add(new ChatMessage("assistant", finalReply));
+    trimChatHistory(data);
 
     return finalReply;
+  }
+
+  /**
+   * No modo agent, respostas curtas como "7" ou "2" precisam ser transformadas em
+   * contexto explícito antes de ir ao LLM. Sem isso, o modelo recebe apenas um ordinal
+   * solto e pode falhar em conectar a escolha à lista apresentada no turno anterior.
+   */
+  private String contextualizeAgentSelection(ConversationData data, String rawMessage, String normalized) {
+    if (rawMessage == null || rawMessage.isBlank()) {
+      return rawMessage;
+    }
+
+    if (!data.availableTimeOptions.isEmpty()) {
+      OptionalInt selectedTimeIndex = parseOrdinalSelection(rawMessage, data.availableTimeOptions.size());
+      if (selectedTimeIndex.isPresent()) {
+        String selectedTime = data.availableTimeOptions.get(selectedTimeIndex.getAsInt());
+        LOG.debugf("[Agent] Reescrevendo escolha ordinal de horário: input=%s horario=%s", rawMessage, selectedTime);
+        return rawMessage + "\n[Sistema: o cliente escolheu o horário " + selectedTime
+            + " da lista de opções já apresentada.]";
+      }
+
+      Optional<String> extractedTime = DateTimeRegexExtractor.extractTime(rawMessage);
+      if (extractedTime.isPresent()) {
+        String normalizedTime = normalizeTime(extractedTime.get());
+        if (data.availableTimeOptions.contains(normalizedTime)) {
+          LOG.debugf("[Agent] Reescrevendo escolha literal de horário: input=%s horario=%s", rawMessage, normalizedTime);
+          return rawMessage + "\n[Sistema: o cliente escolheu o horário " + normalizedTime
+              + " da lista de opções já apresentada.]";
+        }
+      }
+    }
+
+    if (data.professionalId == null && !data.professionalOptionNames.isEmpty()) {
+      OptionalInt selectedProfessionalIndex = parseOrdinalSelection(rawMessage, data.professionalOptionNames.size());
+      if (selectedProfessionalIndex.isPresent()) {
+        String selectedProfessional = data.professionalOptionNames.get(selectedProfessionalIndex.getAsInt());
+        LOG.debugf("[Agent] Reescrevendo escolha ordinal de profissional: input=%s profissional=%s",
+            rawMessage, selectedProfessional);
+        return rawMessage + "\n[Sistema: o cliente escolheu o profissional " + selectedProfessional
+            + " da lista de opções já apresentada.]";
+      }
+    }
+
+    if (!data.appointmentOptionLabels.isEmpty()) {
+      OptionalInt selectedAppointmentIndex = parseOrdinalSelection(rawMessage, data.appointmentOptionLabels.size());
+      if (selectedAppointmentIndex.isPresent()) {
+        String selectedAppointment = data.appointmentOptionLabels.get(selectedAppointmentIndex.getAsInt());
+        LOG.debugf("[Agent] Reescrevendo escolha ordinal de agendamento: input=%s agendamento=%s",
+            rawMessage, selectedAppointment);
+        return rawMessage + "\n[Sistema: o cliente escolheu a opção " + selectedAppointment
+            + " da lista de agendamentos já apresentada.]";
+      }
+    }
+
+    // Mantém a mensagem original quando não há escolha estruturada para contextualizar.
+    return rawMessage;
   }
 
   /**
@@ -242,34 +354,18 @@ public class AssistantConversationService {
       return result.text();
     }
 
-    // CONSULTAR_HORARIOS — busca horários e re-chama LLM com o resultado
     LlmBookingAgent.AgentAction slotsAction = result.firstAction("CONSULTAR_HORARIOS");
     if (slotsAction != null) {
       String toolResult = executeConsultarHorarios(slotsAction, data, tenantId);
-      // Injeta o resultado como contexto e pede ao LLM para apresentar ao cliente
-      String toolContext = "[Sistema] Horários disponíveis:\n" + toolResult
-          + "\nApresente esses horários ao cliente e peça para escolher pelo número ou digitando o horário.";
-      List<ChatMessage> tempHistory = new ArrayList<>(data.chatHistory);
-      tempHistory.add(new ChatMessage("assistant", result.text()));
-      LlmBookingAgent.AgentResult followUp = llmBookingAgent.chat(
-          systemPrompt, tempHistory, toolContext, data.activeProvider);
-      return followUp.text().isBlank() ? result.text() : followUp.text();
+      return buildDeterministicAvailableSlotsReply(data, toolResult, result.text());
     }
 
-    // CRIAR_AGENDAMENTO — cria o agendamento e re-chama LLM com confirmação
     LlmBookingAgent.AgentAction bookAction = result.firstAction("CRIAR_AGENDAMENTO");
     if (bookAction != null) {
       String toolResult = executeCriarAgendamento(bookAction, data, userIdentifier, tenantId);
-      List<ChatMessage> tempHistory = new ArrayList<>(data.chatHistory);
-      tempHistory.add(new ChatMessage("assistant", result.text()));
-      tempHistory.add(new ChatMessage("user", "[Sistema] " + toolResult
-          + "\nConfirme o agendamento ao cliente com um resumo amigável."));
-      LlmBookingAgent.AgentResult followUp = llmBookingAgent.chat(
-          systemPrompt, tempHistory, "", data.activeProvider);
-      return followUp.text().isBlank() ? toolResult : followUp.text();
+      return buildDeterministicBookingConfirmationReply(data, toolResult);
     }
 
-    // CANCELAR_AGENDAMENTO
     LlmBookingAgent.AgentAction cancelAction = result.firstAction("CANCELAR_AGENDAMENTO");
     if (cancelAction != null) {
       return executeCancelarAgendamento(cancelAction, data, userIdentifier, tenantId);
@@ -318,6 +414,48 @@ public class AssistantConversationService {
     }
   }
 
+  private String buildDeterministicAvailableSlotsReply(
+      ConversationData data,
+      String toolResult,
+      String fallbackReply) {
+    if (toolResult == null || toolResult.isBlank()) {
+      return fallbackReply;
+    }
+
+    String normalizedToolResult = TextNormalizer.normalize(toolResult);
+    if (normalizedToolResult.contains("nao consegui")
+        || normalizedToolResult.contains("erro ao consultar")
+        || normalizedToolResult.contains("sem horarios disponiveis")) {
+      return toolResult;
+    }
+
+    if (data == null || data.availableTimeOptions == null || data.availableTimeOptions.isEmpty()) {
+      return toolResult;
+    }
+
+    StringBuilder reply = new StringBuilder("Encontrei estes horarios");
+    List<String> details = new ArrayList<>();
+    if (data.serviceName != null && !data.serviceName.isBlank()) {
+      details.add("para " + data.serviceName);
+    }
+    if (data.professionalName != null && !data.professionalName.isBlank()) {
+      details.add("com " + data.professionalName);
+    }
+    if (data.date != null) {
+      details.add("em " + formatDateBr(data.date));
+    }
+    if (!details.isEmpty()) {
+      reply.append(" ").append(String.join(" ", details));
+    }
+    reply.append(":\n");
+
+    for (int i = 0; i < data.availableTimeOptions.size(); i++) {
+      reply.append(i + 1).append(". ").append(data.availableTimeOptions.get(i)).append("\n");
+    }
+    reply.append("Pode escolher pelo numero ou digitando o horario que voce prefere.");
+    return reply.toString().trim();
+  }
+
   private String executeCriarAgendamento(LlmBookingAgent.AgentAction action,
       ConversationData data, String userIdentifier, String tenantId) {
     try {
@@ -352,6 +490,12 @@ public class AssistantConversationService {
         return "[Sistema] Data inválida — essa data já passou. Informe ao cliente e peça uma data a partir de hoje.";
       }
 
+      if (!domainService.isSlotAvailable(tenantId, data.professionalId, data.date, data.time, data.serviceId)) {
+        LOG.infof("[Agent] Horario ficou indisponivel antes da criacao: prof=%s data=%s hora=%s",
+            data.professionalId, data.date, data.time);
+        return buildUnavailableSelectedTimeReply(data, tenantId);
+      }
+
       UUID appointmentId = domainService.createPendingAppointment(
           tenantId, data.serviceId, data.professionalId, data.date, data.time,
           userIdentifier, data.customerName);
@@ -365,6 +509,72 @@ public class AssistantConversationService {
       LOG.warnf("[Agent] Erro ao criar agendamento: %s", e.getMessage());
       return "Não consegui criar o agendamento. Verifique se o horário ainda está disponível.";
     }
+  }
+
+  private String buildUnavailableSelectedTimeReply(ConversationData data, String tenantId) {
+    List<String> freshSlots = domainService.suggestTimes(
+        tenantId,
+        data.professionalId,
+        data.date,
+        data.serviceId,
+        data.preferredPeriod);
+    data.availableTimeOptions = new ArrayList<>(freshSlots);
+    data.time = null;
+    data.stage = ConversationStage.ASK_TIME;
+
+    if (freshSlots.isEmpty()) {
+      return "Esse horario acabou de ficar indisponivel. Quer tentar outro periodo ou outra data?";
+    }
+
+    StringBuilder reply = new StringBuilder(
+        "Esse horario acabou de ficar indisponivel. Tenho estas opcoes agora:\n");
+    for (int i = 0; i < freshSlots.size(); i++) {
+      reply.append(i + 1).append(". ").append(freshSlots.get(i)).append("\n");
+    }
+    reply.append("Pode escolher pelo numero ou digitando o horario.");
+    return reply.toString().trim();
+  }
+
+  private String buildDeterministicBookingConfirmationReply(ConversationData data, String toolResult) {
+    if (toolResult == null || toolResult.isBlank()) {
+      return "Agendamento criado com sucesso!";
+    }
+
+    if (!toolResult.startsWith("Agendamento criado com sucesso!")) {
+      return toolResult;
+    }
+
+    StringBuilder reply = new StringBuilder("Agendamento confirmado");
+    List<String> summary = new ArrayList<>();
+    if (data != null && data.serviceName != null && !data.serviceName.isBlank()) {
+      summary.add(data.serviceName);
+    }
+    if (data != null && data.professionalName != null && !data.professionalName.isBlank()) {
+      summary.add("com " + data.professionalName);
+    }
+    if (data != null && data.date != null) {
+      summary.add("para " + formatDateBr(data.date));
+    }
+    if (data != null && data.time != null && !data.time.isBlank()) {
+      summary.add("as " + data.time);
+    }
+
+    if (!summary.isEmpty()) {
+      reply.append(": ").append(String.join(" ", summary));
+    } else {
+      reply.append('.');
+    }
+
+    if (data != null && data.customerName != null && !data.customerName.isBlank()) {
+      reply.append(" Tudo certo, ").append(data.customerName).append('.');
+    }
+
+    reply.append(" Se precisar de mais alguma coisa, e so me chamar.");
+    return reply.toString().trim();
+  }
+
+  private String formatDateBr(LocalDate date) {
+    return date == null ? null : DATE_BR_FORMATTER.format(date);
   }
 
   private String executeCancelarAgendamento(LlmBookingAgent.AgentAction action,
@@ -389,6 +599,12 @@ public class AssistantConversationService {
   private String handleMessage(ConversationData data, String rawMessage, String userIdentifier, String tenantId) {
     String normalized = TextNormalizer.normalize(rawMessage);
 
+    if (isServiceCatalogQuery(normalized)) {
+      clearBookingFlow(data, tenantId);
+      data.stage = ConversationStage.ASK_SERVICE;
+      return domainService.formatServicesPromptForCustomer(tenantId, data.customerName);
+    }
+
     // Confirmação de presença via lembrete automático — tratamento determinístico,
     // independente do fluxo de booking. Tem prioridade sobre qualquer outro estágio.
     if (data.stage == ConversationStage.AWAITING_APPOINTMENT_CONFIRMATION) {
@@ -398,12 +614,20 @@ public class AssistantConversationService {
       return handleReactivationReply(data, rawMessage, normalized, userIdentifier, tenantId);
     }
 
+    BookingLeadSignals bookingLead = detectBookingLeadSignals(rawMessage, data, tenantId);
+    applyBookingLeadSignals(data, bookingLead);
+    syncBookingStageFromKnownSlots(data);
+    boolean hasOperationalBookingLead = hasOperationalBookingLead(bookingLead);
+
     boolean prioritizeSlotInput = shouldPrioritizeSlotInput(data, rawMessage, normalized);
-    if (!prioritizeSlotInput && isDeterministicGreeting(normalized) && data.stage != ConversationStage.CONFIRMATION) {
+    if (!hasOperationalBookingLead
+        && !prioritizeSlotInput
+        && isDeterministicGreeting(normalized)
+        && data.stage != ConversationStage.CONFIRMATION) {
       return greetingReplyForCurrentStage(data, tenantId);
     }
 
-    IntentPrediction intentPrediction = intentClassifier.classifyWithConfidence(rawMessage);
+    IntentPrediction intentPrediction = resolveIntentWithLlmPriority(rawMessage, data.stage);
     IntentType intent = intentPrediction.intent;
     String correctionReply = handleCorrections(data, normalized, tenantId);
     if (correctionReply != null) {
@@ -411,10 +635,11 @@ public class AssistantConversationService {
     }
 
     // Enriquecimento via Ollama: tenta melhorar a classificação quando OpenNLP tem baixa confiança
-    intentPrediction = enrichIntentWithOllama(intentPrediction, rawMessage, data.stage);
     intent = intentPrediction.intent;
 
-    String disambiguationReply = handleLowConfidenceIntent(data, intentPrediction, prioritizeSlotInput);
+    String disambiguationReply = hasOperationalBookingLead
+        ? null
+        : handleLowConfidenceIntent(data, intentPrediction, prioritizeSlotInput);
     if (disambiguationReply != null) {
       return disambiguationReply;
     }
@@ -454,20 +679,55 @@ public class AssistantConversationService {
       return "Não entendi direito. Manda *SIM* pra confirmar ou *NÃO* pra cancelar, tá? 😊";
     }
 
-    if (!prioritizeSlotInput && intent == IntentType.GREETING && data.stage != ConversationStage.CONFIRMATION) {
+    if (!hasOperationalBookingLead
+        && !prioritizeSlotInput
+        && intent == IntentType.GREETING
+        && data.stage != ConversationStage.CONFIRMATION) {
       return greetingReplyForCurrentStage(data, tenantId);
     }
-    if (!prioritizeSlotInput && intent == IntentType.LIST) {
+    if (!hasOperationalBookingLead
+        && !prioritizeSlotInput
+        && isServiceCatalogQuery(normalized)
+        && data.stage != ConversationStage.CONFIRMATION) {
+      data.stage = ConversationStage.ASK_SERVICE;
+      return domainService.formatServicesPromptForCustomer(tenantId, data.customerName);
+    }
+    if (!hasOperationalBookingLead
+        && !prioritizeSlotInput
+        && isLikelyNewBookingRequest(normalized)
+        && data.stage != ConversationStage.CONFIRMATION) {
+      data.stage = ConversationStage.ASK_SERVICE;
+      List<ServicoDto> matchingServices = domainService.findMatchingServices(tenantId, rawMessage, 5);
+      if (!matchingServices.isEmpty()) {
+        data.serviceId = null;
+        data.serviceName = null;
+        return domainService.formatServiceOptionsPrompt(tenantId, data.customerName, rawMessage, matchingServices);
+      }
+      return domainService.formatServicesPromptForCustomer(tenantId, data.customerName);
+    }
+    if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.LIST) {
       data.stage = ConversationStage.START;
       return domainService.listUpcomingForUser(tenantId, userIdentifier);
     }
-    if (!prioritizeSlotInput && intent == IntentType.CANCEL) {
+    if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.CANCEL
+        && data.stage != ConversationStage.ASK_CANCEL_APPOINTMENT
+        && data.stage != ConversationStage.ASK_RESCHEDULE_APPOINTMENT
+        && data.stage != ConversationStage.ASK_DATE
+        && data.stage != ConversationStage.ASK_PERIOD
+        && data.stage != ConversationStage.ASK_TIME
+        && data.stage != ConversationStage.CONFIRMATION) {
       if (!domainService.canCancelViaWhatsApp(tenantId)) {
         return "Esse salão não permite cancelamentos pelo WhatsApp agora. 😕";
       }
       return iniciarFluxoCancelamento(data, userIdentifier, tenantId);
     }
-    if (!prioritizeSlotInput && intent == IntentType.RESCHEDULE) {
+    if (!hasOperationalBookingLead && !prioritizeSlotInput && intent == IntentType.RESCHEDULE
+        && data.stage != ConversationStage.ASK_CANCEL_APPOINTMENT
+        && data.stage != ConversationStage.ASK_RESCHEDULE_APPOINTMENT
+        && data.stage != ConversationStage.ASK_DATE
+        && data.stage != ConversationStage.ASK_PERIOD
+        && data.stage != ConversationStage.ASK_TIME
+        && data.stage != ConversationStage.CONFIRMATION) {
       if (!domainService.canRescheduleViaWhatsApp(tenantId)) {
         return "Esse salão não permite remarcações pelo WhatsApp agora. 😕";
       }
@@ -475,7 +735,7 @@ public class AssistantConversationService {
     }
 
     // Pergunta de preço/valor: responde com a lista de serviços incluindo preços
-    if (!prioritizeSlotInput && isPriceQuery(normalized)
+    if (!hasOperationalBookingLead && !prioritizeSlotInput && isPriceQuery(normalized)
         && data.stage != ConversationStage.CONFIRMATION) {
       return domainService.formatServicesPromptForCustomer(tenantId, data.customerName);
     }
@@ -546,20 +806,19 @@ public class AssistantConversationService {
       if (!domainService.canScheduleViaWhatsApp(tenantId)) {
         return "Esse salão não permite novos agendamentos pelo WhatsApp agora. 😕";
       }
-      data.stage = (data.customerName != null && !data.customerName.isBlank())
-          ? ConversationStage.ASK_SERVICE
-          : ConversationStage.ASK_NAME;
+      syncBookingStageFromKnownSlots(data);
     }
 
     if (data.customerName == null || data.customerName.isBlank()) {
       String maybeName = extractCustomerName(rawMessage);
       if (maybeName != null) {
         data.customerName = maybeName;
-        data.stage = ConversationStage.ASK_SERVICE;
+        data.stageAttempts = 0;
+        syncBookingStageFromKnownSlots(data);
         // Retorna imediatamente — a mesma mensagem do nome NÃO deve ser reutilizada
         // para resolução de serviço, evitando que o Ollama alucie um serviço a partir
         // do nome do cliente (ex: "Carlos Silva" → "Barba").
-        return domainService.formatServicesPrompt(tenantId);
+        return promptForSyncedStage(data, tenantId);
       } else {
         data.stage = ConversationStage.ASK_NAME;
         return "Oi! Pra começar, me conta seu nome completo. 😊";
@@ -567,8 +826,22 @@ public class AssistantConversationService {
     }
 
     if (data.serviceId == null) {
-      Optional<String> extracted = serviceNameFinder.extractFirst(rawMessage);
-      Optional<ServicoDto> resolved = extracted.flatMap(n -> domainService.resolveService(tenantId, n));
+      // Resolução por ordinal: "1", "2", etc. seleciona da lista de serviços
+      Optional<ServicoDto> resolvedByOrdinal = Optional.empty();
+      try {
+        int ordinal = Integer.parseInt(normalized.strip());
+        if (ordinal >= 1) {
+          List<ServicoDto> allServices = domainService.listServices(tenantId);
+          if (ordinal <= allServices.size()) {
+            resolvedByOrdinal = Optional.of(allServices.get(ordinal - 1));
+          }
+        }
+      } catch (NumberFormatException ignored) {}
+
+      Optional<String> extracted = resolvedByOrdinal.isPresent()
+          ? Optional.empty() : serviceNameFinder.extractFirst(rawMessage);
+      Optional<ServicoDto> resolved = resolvedByOrdinal.isPresent()
+          ? resolvedByOrdinal : extracted.flatMap(n -> domainService.resolveService(tenantId, n));
       if (resolved.isEmpty()) {
         resolved = domainService.resolveService(tenantId, rawMessage);
       }
@@ -593,6 +866,13 @@ public class AssistantConversationService {
       } else {
         data.stage = ConversationStage.ASK_SERVICE;
         data.stageAttempts++;
+        List<ServicoDto> matchingServices = domainService.findMatchingServices(tenantId, rawMessage, 5);
+        if (!matchingServices.isEmpty()) {
+          data.serviceId = null;
+          data.serviceName = null;
+          return withHandoffIfNeeded(data,
+              domainService.formatServiceOptionsPrompt(tenantId, data.customerName, rawMessage, matchingServices));
+        }
         return withHandoffIfNeeded(data, domainService.formatServicesPromptForCustomer(tenantId, data.customerName));
       }
     }
@@ -676,7 +956,7 @@ public class AssistantConversationService {
       }
     }
 
-    if (data.preferredPeriod == null) {
+    if (data.preferredPeriod == null && data.time == null) {
       Optional<TimePeriod> period = TimePeriod.fromText(normalized);
       // Fallback Ollama: expressões como "de manhã cedo", "pós-almoço", "fim do dia"
       if (period.isEmpty()) {
@@ -720,9 +1000,28 @@ public class AssistantConversationService {
         data.availableTimeOptions = new ArrayList<>(domainService.suggestTimes(tenantId, data.professionalId, data.date, data.serviceId, data.preferredPeriod));
       }
       if (data.availableTimeOptions.isEmpty()) {
+        // "1", "2", "3" → manhã/tarde/noite quando não há slots no período atual
+        String trimmedNorm = normalized.strip();
+        TimePeriod periodByNumber = switch (trimmedNorm) {
+          case "1" -> TimePeriod.MORNING;
+          case "2" -> TimePeriod.AFTERNOON;
+          case "3" -> TimePeriod.NIGHT;
+          default  -> null;
+        };
+        if (periodByNumber != null && periodByNumber != data.preferredPeriod) {
+          data.preferredPeriod = periodByNumber;
+          data.availableTimeOptions.clear();
+          data.availableTimeOptions = new ArrayList<>(domainService.suggestTimes(tenantId, data.professionalId, data.date, data.serviceId, data.preferredPeriod));
+          if (!data.availableTimeOptions.isEmpty()) {
+            data.stage = ConversationStage.ASK_TIME;
+            return "Qual horário de " + preferredPeriodLabel(data) + " fica bom? Escolha pelo número:\n"
+                + buildNumberedTimeList(data.availableTimeOptions)
+                + "\nOu fala outro período ou \"trocar dia\". 😊";
+          }
+        }
         data.stage = ConversationStage.ASK_TIME;
-        return "Não tem horário vago de " + data.preferredPeriod.label()
-            + " nessa data. 😕 Quer tentar outro período (manhã/tarde/noite) ou mudar o dia?";
+        return "Não tem horário vago de " + preferredPeriodLabel(data)
+            + " nessa data. 😕 Quer tentar outro período (1-manhã / 2-tarde / 3-noite) ou manda \"trocar dia\".";
       }
 
       OptionalInt index = parseOrdinalSelection(rawMessage, data.availableTimeOptions.size());
@@ -736,7 +1035,7 @@ public class AssistantConversationService {
             data.time = normalizedTime;
           } else {
             data.stage = ConversationStage.ASK_TIME;
-            return "Esse horário não está disponível. Escolha um dos vagos de " + data.preferredPeriod.label() + ":\n"
+            return "Esse horário não está disponível. Escolha um dos vagos de " + preferredPeriodLabel(data) + ":\n"
                 + buildNumberedTimeList(data.availableTimeOptions)
                 + "\nOu fala outro período ou \"trocar dia\" pra mudar. 😊";
           }
@@ -747,11 +1046,11 @@ public class AssistantConversationService {
         data.stage = ConversationStage.ASK_TIME;
         String bestSlot = data.availableTimeOptions.isEmpty() ? null : data.availableTimeOptions.get(0);
         java.util.Optional<String> llmTime = ollamaResponseService.generateTimeSlotsMessage(
-            data.preferredPeriod.label(), data.availableTimeOptions, bestSlot);
+            preferredPeriodLabel(data), data.availableTimeOptions, bestSlot);
         if (llmTime.isPresent()) {
           return llmTime.get();
         }
-        return "Qual horário de " + data.preferredPeriod.label() + " fica bom? Escolha pelo número:\n"
+        return "Qual horário de " + preferredPeriodLabel(data) + " fica bom? Escolha pelo número:\n"
             + buildNumberedTimeList(data.availableTimeOptions)
             + "\nOu fala outro período ou \"trocar dia\". 😊";
       }
@@ -788,7 +1087,7 @@ public class AssistantConversationService {
         return "Esse horário ficou indisponível e não tem mais vaga nesse período. 😕 "
             + "Quer tentar outro período (manhã/tarde/noite) ou mudar o dia?";
       }
-      return "Esse horário ficou indisponível. Escolha outro de " + data.preferredPeriod.label() + ":\n"
+      return "Esse horário ficou indisponível. Escolha outro de " + preferredPeriodLabel(data) + ":\n"
           + buildNumberedTimeList(data.availableTimeOptions);
     }
 
@@ -825,7 +1124,7 @@ public class AssistantConversationService {
               + "Quer mudar o período (manhã/tarde/noite) ou o dia?";
         }
         return "Esse horário acabou de ser reservado por outro cliente. Escolha um novo de "
-            + data.preferredPeriod.label() + ":\n" + buildNumberedTimeList(data.availableTimeOptions);
+            + preferredPeriodLabel(data) + ":\n" + buildNumberedTimeList(data.availableTimeOptions);
       }
     }
 
@@ -1062,6 +1361,16 @@ public class AssistantConversationService {
         return OptionalInt.of(index);
       }
     }
+    // Extrai número isolado no final ou precedido por artigo/preposição ("o 2", "fica o 1", "numero 3")
+    java.util.regex.Matcher m = java.util.regex.Pattern
+        .compile("(?:^|\\s)(?:o|a|numero|opcao|opcão|item)?\\s*(\\d+)\\s*$")
+        .matcher(normalized);
+    if (m.find()) {
+      int index = Integer.parseInt(m.group(1)) - 1;
+      if (index >= 0 && index < optionSize) {
+        return OptionalInt.of(index);
+      }
+    }
     return OptionalInt.empty();
   }
 
@@ -1269,6 +1578,57 @@ public class AssistantConversationService {
         || (hasWord(normalized, "custa") && normalized.length() < 60);
   }
 
+  private boolean isLikelyNewBookingRequest(String normalized) {
+    if (normalized == null || normalized.isBlank()) return false;
+
+    boolean mentionsExistingAppointment =
+        normalized.contains("agendamento")
+            || normalized.contains("agendamentos")
+            || normalized.contains("meu horario")
+            || normalized.contains("meus horarios")
+            || normalized.contains("marcado")
+            || normalized.contains("marcados")
+            || normalized.contains("remarcar")
+            || normalized.contains("reagendar")
+            || normalized.contains("cancelar")
+            || normalized.contains("trocar")
+            || normalized.contains("mudar")
+            || normalized.contains("alterar");
+
+    if (mentionsExistingAppointment) return false;
+
+    boolean desireVerb =
+        normalized.startsWith("quero ")
+            || normalized.startsWith("queria ")
+            || normalized.startsWith("gostaria ")
+            || normalized.startsWith("preciso ")
+            || normalized.contains(" quero ")
+            || normalized.contains(" queria ")
+            || normalized.contains(" gostaria ")
+            || normalized.contains(" preciso ")
+            || normalized.contains("to querendo")
+            || normalized.contains("estou querendo");
+
+    boolean serviceLikeExpression =
+        normalized.contains("cortar")
+            || normalized.contains("corte")
+            || normalized.contains("cabelo")
+            || normalized.contains("barba")
+            || normalized.contains("unha")
+            || normalized.contains("sobrancelha")
+            || normalized.contains("escova")
+            || normalized.contains("progressiva")
+            || normalized.contains("hidratacao")
+            || normalized.contains("botox capilar")
+            || normalized.contains("coloracao")
+            || normalized.contains("mechas")
+            || normalized.contains("luzes")
+            || normalized.contains("atendimento")
+            || normalized.contains("servico");
+
+    return desireVerb && serviceLikeExpression;
+  }
+
   private boolean shouldPrioritizeSlotInput(ConversationData data, String rawMessage, String normalized) {
     if (wantsChangeDay(normalized)) {
       return data.serviceId != null && data.professionalId != null;
@@ -1450,6 +1810,34 @@ public class AssistantConversationService {
         && data.appointmentOptionLabels.isEmpty();
   }
 
+  private IntentPrediction resolveIntentWithLlmPriority(String rawMessage, ConversationStage stage) {
+    IntentPrediction fallback = intentClassifier.classifyWithConfidence(rawMessage);
+
+    if (fallback.intent == IntentType.GREETING && fallback.confidence >= minIntentConfidence) {
+      LOG.debugf("[Intent] OpenNLP rapido para saudacao (conf=%.2f)", fallback.confidence);
+      return fallback;
+    }
+    if (stage == ConversationStage.ASK_DATE
+        || stage == ConversationStage.ASK_PERIOD
+        || stage == ConversationStage.ASK_TIME
+        || stage == ConversationStage.ASK_NAME
+        || stage == ConversationStage.CONFIRMATION) {
+      return fallback;
+    }
+
+    Optional<IntentPrediction> llmPrediction = ollamaIntentService.classify(rawMessage, stage.name())
+        .filter(p -> p.confidence >= ollamaMinConfidence && p.intent != IntentType.UNKNOWN);
+    if (llmPrediction.isPresent()) {
+      LOG.infof("[Intent] LLM prioritaria (intent=%s conf=%.2f stage=%s fallback=%s/%.2f)",
+          llmPrediction.get().intent, llmPrediction.get().confidence, stage, fallback.intent, fallback.confidence);
+      return llmPrediction.get();
+    }
+
+    LOG.infof("[Intent] LLM sem resultado util, usando fallback local (intent=%s conf=%.2f stage=%s)",
+        fallback.intent, fallback.confidence, stage);
+    return fallback;
+  }
+
   private IntentPrediction enrichIntentWithOllama(IntentPrediction current, String rawMessage, ConversationStage stage) {
     // GREETING é sempre rápido — não precisa do Ollama
     if (current.intent == IntentType.GREETING) {
@@ -1485,17 +1873,19 @@ public class AssistantConversationService {
     if (intentPrediction.intent == IntentType.GREETING) return null;
     if (intentPrediction.intent != IntentType.UNKNOWN && intentPrediction.confidence >= minIntentConfidence) return null;
 
-    // Stages onde o usuário preenche slot literal: deixar a lógica de resolução tentar.
-    // Se falhar, cada stage já tem sua própria mensagem de reprompt (serviços, profissionais, etc.)
+    // Stages onde o usuário preenche slot literal OU tem handler próprio:
+    // deixar a lógica específica do stage agir em vez do menu genérico.
     if (data.stage == ConversationStage.ASK_DATE
         || data.stage == ConversationStage.ASK_PERIOD
         || data.stage == ConversationStage.ASK_TIME
         || data.stage == ConversationStage.ASK_NAME
         || data.stage == ConversationStage.ASK_SERVICE
         || data.stage == ConversationStage.ASK_PROFESSIONAL
+        || data.stage == ConversationStage.ASK_CANCEL_APPOINTMENT
+        || data.stage == ConversationStage.ASK_RESCHEDULE_APPOINTMENT
         || data.stage == ConversationStage.CONFIRMATION) return null;
 
-    // START / COMPLETED / cancel / reschedule stages: menu global faz sentido
+    // START / COMPLETED: menu global faz sentido
     return "Não entendi direito. O que você quer? 😊\n1 - Agendar\n2 - Remarcar\n3 - Cancelar\n4 - Ver meus agendamentos";
   }
 
@@ -1690,6 +2080,355 @@ public class AssistantConversationService {
     return isInformalAffirmative(normalized) || DateTimeRegexExtractor.isAffirmative(normalized);
   }
 
+  String compactMessageForLlm(String message) {
+    if (message == null || message.isBlank()) return message;
+
+    String normalized = message
+        .replace("\r\n", "\n")
+        .replaceAll("[ \\t]{2,}", " ")
+        .replaceAll("\\n{3,}", "\n\n")
+        .trim();
+
+    int maxChars = Math.max(llmMaxInputChars, 200);
+    if (normalized.length() <= maxChars) {
+      return normalized;
+    }
+
+    String notice = "\n[Mensagem longa truncada pelo sistema. Foque no pedido principal visivel.]\n";
+    int remaining = maxChars - notice.length();
+    if (remaining <= 120) {
+      return normalized.substring(0, Math.min(normalized.length(), maxChars));
+    }
+
+    int head = Math.max(remaining * 2 / 3, 120);
+    int tail = Math.max(remaining - head, 80);
+    head = Math.min(head, normalized.length());
+    tail = Math.min(tail, normalized.length() - head);
+
+    String compacted = normalized.substring(0, head).trim()
+        + notice
+        + normalized.substring(normalized.length() - tail).trim();
+    LOG.infof("[Agent] Mensagem compactada para o LLM: original=%d chars compactada=%d chars",
+        normalized.length(),
+        compacted.length());
+    return compacted;
+  }
+
+  LlmBookingAgent.AgentChatOptions buildAgentChatOptions(
+      ConversationData data,
+      String rawMessage,
+      String tenantId,
+      PreparedSlotContext preparedSlotContext) {
+    String runtimeInstruction = null;
+    Integer maxTokens = null;
+
+    if (preparedSlotContext != null && preparedSlotContext.hasPreparedAnswer()) {
+      runtimeInstruction = """
+          HORARIOS JA CONSULTADOS:
+          - Os horarios reais ja foram consultados pelo sistema neste turno.
+          - Use apenas os horarios informados no contexto.
+          - Nao emita [CONSULTAR_HORARIOS] neste turno.
+          - Se nao houver horarios, explique isso e sugira outro periodo ou outra data.
+          """;
+    }
+
+    if (shouldUseShortReplyMode(data, rawMessage, tenantId)) {
+      maxTokens = Math.max(shortResponseMaxTokens, 24);
+      runtimeInstruction = mergeRuntimeInstructions(runtimeInstruction, """
+          RESPOSTA CURTA:
+          - Se a pergunta for simples, responda em no maximo 1 frase curta.
+          - Seja direta e objetiva.
+          - Nao use listas nem explicacoes longas.
+          - Nao emita action tokens desnecessarios.
+          """);
+    }
+
+    if (maxTokens == null && (runtimeInstruction == null || runtimeInstruction.isBlank())) {
+      return LlmBookingAgent.AgentChatOptions.defaultOptions();
+    }
+
+    return new LlmBookingAgent.AgentChatOptions(maxTokens, runtimeInstruction);
+  }
+
+  private String mergeRuntimeInstructions(String currentInstruction, String newInstruction) {
+    if (currentInstruction == null || currentInstruction.isBlank()) {
+      return newInstruction;
+    }
+    if (newInstruction == null || newInstruction.isBlank()) {
+      return currentInstruction;
+    }
+    return currentInstruction.trim() + "\n\n" + newInstruction.trim();
+  }
+
+  private PreparedSlotContext prepareAvailableSlotsForAgent(
+      ConversationData data,
+      String normalizedMessage,
+      String tenantId) {
+    if (data == null || tenantId == null) return PreparedSlotContext.empty();
+    if (data.professionalId == null || data.date == null || data.time != null) return PreparedSlotContext.empty();
+
+    boolean shouldUsePreparedSlots = data.stage == ConversationStage.ASK_TIME
+        || data.stage == ConversationStage.CONFIRMATION
+        || (!data.availableTimeOptions.isEmpty() && data.stage == ConversationStage.ASK_TIME)
+        || mentionsTimeInquiry(normalizedMessage);
+    if (!shouldUsePreparedSlots) {
+      return PreparedSlotContext.empty();
+    }
+
+    List<String> slots = data.availableTimeOptions;
+    if (slots == null || slots.isEmpty()) {
+      slots = domainService.suggestTimes(
+          tenantId,
+          data.professionalId,
+          data.date,
+          data.serviceId,
+          data.preferredPeriod);
+      data.availableTimeOptions = new ArrayList<>(slots);
+    }
+
+    return new PreparedSlotContext(true, new ArrayList<>(data.availableTimeOptions));
+  }
+
+  private String appendPreparedSlotsForAgent(String message, PreparedSlotContext preparedSlotContext) {
+    if (preparedSlotContext == null || !preparedSlotContext.hasPreparedAnswer()) {
+      return message;
+    }
+
+    if (preparedSlotContext.slots.isEmpty()) {
+      return message + "\n[Sistema: a consulta real de horarios para este atendimento ja foi feita e nao ha vagas para os filtros atuais. Oriente o cliente a escolher outro periodo ou outra data sem emitir CONSULTAR_HORARIOS.]";
+    }
+
+    StringBuilder context = new StringBuilder(
+        message + "\n[Sistema: horarios reais ja consultados para este atendimento:\n");
+    for (int i = 0; i < preparedSlotContext.slots.size(); i++) {
+      context.append(i + 1).append(". ").append(preparedSlotContext.slots.get(i)).append("\n");
+    }
+    context.append("Use apenas estes horarios na resposta e nao emita CONSULTAR_HORARIOS neste turno.]");
+    return context.toString();
+  }
+
+  private boolean mentionsTimeInquiry(String normalizedMessage) {
+    if (normalizedMessage == null || normalizedMessage.isBlank()) return false;
+    return normalizedMessage.contains("horario")
+        || normalizedMessage.contains("hora")
+        || normalizedMessage.contains("manha")
+        || normalizedMessage.contains("tarde")
+        || normalizedMessage.contains("noite")
+        || normalizedMessage.contains("disponivel");
+  }
+
+  boolean shouldUseShortReplyMode(ConversationData data, String rawMessage, String tenantId) {
+    if (rawMessage == null || rawMessage.isBlank()) return false;
+    if (data == null) return false;
+    if (data.stage != ConversationStage.START
+        && data.stage != ConversationStage.COMPLETED
+        && data.stage != ConversationStage.ASK_NAME
+        && data.stage != ConversationStage.ASK_SERVICE) {
+      return false;
+    }
+    if (tenantId != null && detectBookingLeadSignals(rawMessage, data, tenantId).detected) {
+      return false;
+    }
+
+    try {
+      IntentPrediction prediction = intentClassifier.classifyWithConfidence(rawMessage);
+      if (prediction == null) return false;
+      return prediction.intent == IntentType.GREETING || prediction.intent == IntentType.UNKNOWN;
+    } catch (Exception e) {
+      LOG.debugf("[Agent] Falha ao classificar pergunta padrao para resposta curta: %s", e.getMessage());
+      return false;
+    }
+  }
+
+  private void trimChatHistory(ConversationData data) {
+    if (data == null || data.chatHistory == null) return;
+
+    int maxMessages = Math.max(maxHistoryMessages, 20);
+    int keepMessages = Math.min(Math.max(keepHistoryMessages, 10), maxMessages);
+    if (data.chatHistory.size() > maxMessages) {
+      List<ChatMessage> kept = new ArrayList<>(data.chatHistory.subList(
+          Math.max(0, data.chatHistory.size() - keepMessages),
+          data.chatHistory.size()));
+      data.chatHistory.clear();
+      data.chatHistory.addAll(kept);
+    }
+
+    int historyCharsBudget = Math.max(maxHistoryChars, 600);
+    while (data.chatHistory.size() > 2 && estimateHistoryChars(data.chatHistory) > historyCharsBudget) {
+      data.chatHistory.remove(0);
+    }
+  }
+
+  private int estimateHistoryChars(List<ChatMessage> history) {
+    if (history == null || history.isEmpty()) return 0;
+
+    int total = 0;
+    for (ChatMessage message : history) {
+      if (message == null) continue;
+      if (message.role != null) total += message.role.length();
+      if (message.content != null) total += message.content.length();
+      total += 8;
+    }
+    return total;
+  }
+
+  private void applyBookingLeadSignals(ConversationData data, BookingLeadSignals signals) {
+    if (data == null || signals == null) return;
+
+    if (data.serviceId == null && signals.serviceId != null) {
+      try {
+        data.serviceId = UUID.fromString(signals.serviceId);
+      } catch (IllegalArgumentException ignored) {
+        // mantem apenas o nome do servico quando o id vier invalido.
+      }
+    }
+    if ((data.serviceName == null || data.serviceName.isBlank()) && signals.serviceName != null) {
+      data.serviceName = signals.serviceName;
+    }
+    if (data.date == null && signals.date != null) {
+      try {
+        data.date = LocalDate.parse(signals.date);
+      } catch (RuntimeException ignored) {
+        // deixa o fluxo pedir a data novamente se o parsing falhar.
+      }
+    }
+    if ((data.time == null || data.time.isBlank()) && signals.time != null) {
+      data.time = signals.time;
+    }
+  }
+
+  private boolean hasOperationalBookingLead(BookingLeadSignals signals) {
+    return signals != null
+        && (signals.serviceId != null
+            || signals.serviceName != null
+            || signals.date != null
+            || signals.time != null);
+  }
+
+  private void syncBookingStageFromKnownSlots(ConversationData data) {
+    if (data == null || data.stage == null) return;
+    if (data.stage == ConversationStage.AWAITING_APPOINTMENT_CONFIRMATION
+        || data.stage == ConversationStage.AWAITING_REACTIVATION_REPLY
+        || data.stage == ConversationStage.ASK_CANCEL_APPOINTMENT
+        || data.stage == ConversationStage.ASK_RESCHEDULE_APPOINTMENT
+        || data.stage == ConversationStage.CONFIRMATION) {
+      return;
+    }
+
+    if (data.customerName == null || data.customerName.isBlank()) {
+      data.stage = ConversationStage.ASK_NAME;
+    } else if (data.serviceId == null) {
+      data.stage = ConversationStage.ASK_SERVICE;
+    } else if (data.professionalId == null) {
+      data.stage = ConversationStage.ASK_PROFESSIONAL;
+    } else if (data.date == null) {
+      data.stage = ConversationStage.ASK_DATE;
+    } else if (data.time == null) {
+      data.stage = data.preferredPeriod == null ? ConversationStage.ASK_PERIOD : ConversationStage.ASK_TIME;
+    } else {
+      data.stage = ConversationStage.ASK_TIME;
+    }
+  }
+
+  private String promptForSyncedStage(ConversationData data, String tenantId) {
+    if (data == null || data.stage == null) {
+      return domainService.formatServicesPrompt(tenantId);
+    }
+
+    return switch (data.stage) {
+      case ASK_NAME -> "Oi! Pra começar, me conta seu nome completo. 😊";
+      case ASK_SERVICE -> domainService.formatServicesPrompt(tenantId);
+      case ASK_PROFESSIONAL -> buildProfessionalPrompt(data, tenantId);
+      case ASK_DATE -> "Perfeito! Agora me fala o dia que você prefere. 📅";
+      case ASK_PERIOD -> "Legal! Prefere de manhã, tarde ou noite? ☀️🌙";
+      case ASK_TIME -> "Ótimo! Agora me fala o horário que você prefere. ⏰";
+      default -> domainService.formatServicesPrompt(tenantId);
+    };
+  }
+
+  private String appendBookingContextForAgent(ConversationData data, String message, BookingLeadSignals bookingLead) {
+    if (message == null || message.isBlank() || data == null) return message;
+
+    List<String> recognized = new ArrayList<>();
+    if (data.customerName != null && !data.customerName.isBlank()) recognized.add("cliente=" + data.customerName);
+    if (data.serviceName != null && !data.serviceName.isBlank()) recognized.add("servico=" + data.serviceName);
+    if (data.professionalName != null && !data.professionalName.isBlank()) recognized.add("profissional=" + data.professionalName);
+    if (data.date != null) recognized.add("data=" + data.date);
+    if (data.time != null && !data.time.isBlank()) recognized.add("horario=" + data.time);
+    if (recognized.isEmpty() && (bookingLead == null || !bookingLead.detected)) {
+      return message;
+    }
+
+    String pending = switch (data.stage) {
+      case ASK_NAME -> "nome do cliente";
+      case ASK_SERVICE -> "servico";
+      case ASK_PROFESSIONAL -> "profissional";
+      case ASK_DATE -> "data";
+      case ASK_PERIOD -> "periodo";
+      case ASK_TIME -> "horario";
+      case CONFIRMATION -> "confirmacao final";
+      default -> "proximo passo do agendamento";
+    };
+
+    return message + "\n[Sistema: dados operacionais já identificados nesta conversa -> "
+        + String.join(", ", recognized)
+        + ". Conduza apenas o que falta agora: "
+        + pending
+        + ".]";
+  }
+
+  private String preferredPeriodLabel(ConversationData data) {
+    return data != null && data.preferredPeriod != null ? data.preferredPeriod.label() : "esse período";
+  }
+
+  private String handleAgentDeterministicIntent(
+      ConversationData data,
+      String rawMessage,
+      String normalized,
+      BookingLeadSignals bookingLead,
+      String userIdentifier,
+      String tenantId) {
+    boolean hasOperationalBookingLead = hasOperationalBookingLead(bookingLead);
+    boolean prioritizeSlotInput = shouldPrioritizeSlotInput(data, rawMessage, normalized);
+    if (hasOperationalBookingLead || prioritizeSlotInput) {
+      return null;
+    }
+
+    IntentPrediction intentPrediction = resolveIntentWithLlmPriority(rawMessage, data.stage);
+    if (intentPrediction == null) {
+      return null;
+    }
+    IntentType intent = intentPrediction.intent;
+
+    if (isServiceCatalogQuery(normalized) || isLikelyNewBookingRequest(normalized)) {
+      data.stage = ConversationStage.ASK_SERVICE;
+      List<ServicoDto> matchingServices = domainService.findMatchingServices(tenantId, rawMessage, 5);
+      if (!matchingServices.isEmpty()) {
+        data.serviceId = null;
+        data.serviceName = null;
+        return domainService.formatServiceOptionsPrompt(tenantId, data.customerName, rawMessage, matchingServices);
+      }
+      return domainService.formatServicesPromptForCustomer(tenantId, data.customerName);
+    }
+    if (intent == IntentType.LIST) {
+      data.stage = ConversationStage.START;
+      return domainService.listUpcomingForUser(tenantId, userIdentifier);
+    }
+    if (intent == IntentType.CANCEL) {
+      if (!domainService.canCancelViaWhatsApp(tenantId)) {
+        return "Esse salÃ£o nÃ£o permite cancelamentos pelo WhatsApp agora. ðŸ˜•";
+      }
+      return iniciarFluxoCancelamento(data, userIdentifier, tenantId);
+    }
+    if (intent == IntentType.RESCHEDULE) {
+      if (!domainService.canRescheduleViaWhatsApp(tenantId)) {
+        return "Esse salÃ£o nÃ£o permite remarcaÃ§Ãµes pelo WhatsApp agora. ðŸ˜•";
+      }
+      return iniciarFluxoRemarcacao(data, userIdentifier, tenantId);
+    }
+    return null;
+  }
+
   private BookingLeadSignals detectBookingLeadSignals(String rawMessage, ConversationData data, String tenantId) {
     BookingLeadSignals signals = new BookingLeadSignals();
     if (rawMessage == null || rawMessage.isBlank()) return signals;
@@ -1697,31 +2436,78 @@ public class AssistantConversationService {
     String normalized = TextNormalizer.normalize(rawMessage);
     boolean bookingIntent = mentionsBookingIntent(normalized) || isBookIntent(rawMessage);
 
-    if (data.serviceId != null || (data.serviceName != null && !data.serviceName.isBlank())) {
-      signals.serviceId = data.serviceId != null ? data.serviceId.toString() : null;
-      signals.serviceName = data.serviceName;
-    } else {
-      Optional<ServicoDto> resolvedService;
-      Optional<String> extractedName = serviceNameFinder.extractFirst(rawMessage);
-      resolvedService = extractedName.flatMap(name -> domainService.resolveService(tenantId, name));
-      if (resolvedService.isEmpty()) {
-        resolvedService = domainService.resolveService(tenantId, rawMessage);
-      }
-      if (resolvedService.isPresent()) {
-        signals.serviceId = resolvedService.get().id;
-        signals.serviceName = resolvedService.get().name;
-      }
+    Optional<ServicoDto> resolvedService;
+    Optional<String> extractedName = serviceNameFinder.extractFirst(rawMessage);
+    resolvedService = extractedName.flatMap(name -> domainService.resolveService(tenantId, name));
+    if (resolvedService.isEmpty()) {
+      resolvedService = domainService.resolveService(tenantId, rawMessage);
+    }
+    if (resolvedService.isPresent()) {
+      signals.serviceId = resolvedService.get().id;
+      signals.serviceName = resolvedService.get().name;
     }
 
-    LocalDate resolvedDate = data.date != null ? data.date : DateTimeRegexExtractor.extractDate(rawMessage).orElse(null);
-    String resolvedTime = data.time != null && !data.time.isBlank()
-        ? data.time
-        : DateTimeRegexExtractor.extractTime(rawMessage).map(this::normalizeTime).orElse(null);
+    LocalDate resolvedDate = DateTimeRegexExtractor.extractDate(rawMessage).orElse(null);
+    // extractTimeStrict requer HH:MM explícito — evita falsos positivos com ordinais ("1" → "01:00")
+    // e com dígitos de datas ("30/06" → "06:00")
+    String resolvedTime = DateTimeRegexExtractor.extractTimeStrict(rawMessage).map(this::normalizeTime).orElse(null);
 
     signals.date = resolvedDate != null ? resolvedDate.toString() : null;
     signals.time = resolvedTime;
     signals.detected = bookingIntent && (signals.serviceId != null || signals.serviceName != null || signals.date != null || signals.time != null);
     return signals;
+  }
+
+  private String normalizeCurrencyDisplay(String reply) {
+    if (reply == null || reply.isBlank()) return reply;
+
+    Matcher matcher = CENTS_CURRENCY_PATTERN.matcher(reply);
+    StringBuffer sb = new StringBuffer();
+    while (matcher.find()) {
+      String digits = matcher.group(1);
+      BigDecimal reais = new BigDecimal(digits).movePointLeft(2);
+      String formatted = "R$ " + String.format(Locale.ROOT, "%.2f", reais).replace('.', ',');
+      matcher.appendReplacement(sb, Matcher.quoteReplacement(formatted));
+    }
+    matcher.appendTail(sb);
+    return sb.toString();
+  }
+
+  private boolean isServiceCatalogQuery(String normalized) {
+    if (normalized == null || normalized.isBlank()) return false;
+
+    boolean asksForServices =
+        normalized.contains("servico")
+            || normalized.contains("servicos")
+            || normalized.contains("atendimento")
+            || normalized.contains("atendimentos")
+            || normalized.contains("procedimento")
+            || normalized.contains("procedimentos");
+
+    boolean asksToList =
+        normalized.contains("lista")
+            || normalized.contains("listar")
+            || normalized.contains("mostra")
+            || normalized.contains("mostrar")
+            || normalized.contains("quais")
+            || normalized.contains("qual")
+            || normalized.contains("tem")
+            || normalized.contains("oferece")
+            || normalized.contains("oferecem")
+            || normalized.contains("trabalha")
+            || normalized.contains("trabalham");
+
+    boolean asksOwnAppointments =
+        normalized.contains("meus")
+            || normalized.contains("meu")
+            || normalized.contains("tenho")
+            || normalized.contains("marcado")
+            || normalized.contains("marcados")
+            || normalized.contains("agenda")
+            || normalized.contains("reservas")
+            || normalized.contains("proximos horarios");
+
+    return asksForServices && asksToList && !asksOwnAppointments;
   }
 
   private boolean mentionsBookingIntent(String normalized) {
@@ -1751,6 +2537,24 @@ public class AssistantConversationService {
     private String serviceName;
     private String date;
     private String time;
+  }
+
+  private static final class PreparedSlotContext {
+    private final boolean prepared;
+    private final List<String> slots;
+
+    private PreparedSlotContext(boolean prepared, List<String> slots) {
+      this.prepared = prepared;
+      this.slots = slots;
+    }
+
+    private static PreparedSlotContext empty() {
+      return new PreparedSlotContext(false, List.of());
+    }
+
+    private boolean hasPreparedAnswer() {
+      return prepared;
+    }
   }
 
   private boolean hasWord(String text, String word) {
