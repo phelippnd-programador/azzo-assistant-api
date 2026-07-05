@@ -32,6 +32,14 @@ import jakarta.ws.rs.core.MediaType;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
+/**
+ * Endpoints do assistente. TODOS os metodos abaixo (/message e /admin/*) sao
+ * protegidos pelo InternalApiKeyFilter, que exige o header X-Internal-Api-Key.
+ *
+ * SEC-010: os headers X-Tenant-Id / X-User-Identifier / X-User-Name so sao
+ * confiaveis porque o chamador ja foi autenticado como servico interno pela
+ * chave compartilhada. Nao expor estes endpoints publicamente sem o filtro.
+ */
 @Path("/api/v1/assistant")
 @Consumes(MediaType.APPLICATION_JSON)
 @Produces(MediaType.APPLICATION_JSON)

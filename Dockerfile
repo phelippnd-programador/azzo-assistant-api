@@ -13,5 +13,10 @@ WORKDIR /work/
 
 COPY --from=build /app/target/quarkus-app/ /work/
 
-EXPOSE 8080
+# SEC-013: rodar como usuario nao-root.
+RUN groupadd -r azzo && useradd -r -g azzo azzo && chown -R azzo:azzo /work
+USER azzo
+
+# SEC-013: porta consistente com quarkus.http.port=8081.
+EXPOSE 8081
 CMD ["java", "-jar", "quarkus-run.jar"]
