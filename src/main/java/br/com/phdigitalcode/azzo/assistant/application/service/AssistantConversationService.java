@@ -2353,6 +2353,16 @@ public class AssistantConversationService {
     if ((data.serviceName == null || data.serviceName.isBlank()) && signals.serviceName != null) {
       data.serviceName = signals.serviceName;
     }
+    if (data.professionalId == null && signals.professionalId != null) {
+      try {
+        data.professionalId = UUID.fromString(signals.professionalId);
+      } catch (IllegalArgumentException ignored) {
+        // mantem apenas o nome do profissional quando o id vier invalido.
+      }
+    }
+    if ((data.professionalName == null || data.professionalName.isBlank()) && signals.professionalName != null) {
+      data.professionalName = signals.professionalName;
+    }
     if (data.date == null && signals.date != null) {
       try {
         data.date = LocalDate.parse(signals.date);
@@ -2369,6 +2379,8 @@ public class AssistantConversationService {
     return signals != null
         && (signals.serviceId != null
             || signals.serviceName != null
+            || signals.professionalId != null
+            || signals.professionalName != null
             || signals.date != null
             || signals.time != null);
   }
@@ -2595,6 +2607,30 @@ public class AssistantConversationService {
       signals.serviceName = resolvedService.get().name;
     }
 
+    // Resolve o profissional em Java — modelos 8B falham no matching de nomes
+    // ("carlos" -> "Carlos Barbeiro") e chegam a negar que a pessoa existe.
+    UUID serviceIdForLookup = null;
+    if (signals.serviceId != null) {
+      try {
+        serviceIdForLookup = UUID.fromString(signals.serviceId);
+      } catch (IllegalArgumentException ignored) {
+        // segue sem filtrar por serviço
+      }
+    } else if (data != null) {
+      serviceIdForLookup = data.serviceId;
+    }
+    final UUID svcIdForLookup = serviceIdForLookup;
+    Optional<String> extractedProfessional = professionalNameFinder.extractFirst(rawMessage);
+    Optional<ProfissionalDto> resolvedProfessional =
+        extractedProfessional.flatMap(n -> domainService.resolveProfessional(tenantId, n, svcIdForLookup));
+    if (resolvedProfessional.isEmpty() && extractedProfessional.isPresent()) {
+      resolvedProfessional = domainService.resolveProfessional(tenantId, rawMessage, svcIdForLookup);
+    }
+    if (resolvedProfessional.isPresent()) {
+      signals.professionalId = resolvedProfessional.get().id;
+      signals.professionalName = resolvedProfessional.get().name;
+    }
+
     LocalDate resolvedDate = DateTimeRegexExtractor.extractDate(rawMessage).orElse(null);
     // extractTimeStrict requer HH:MM explícito — evita falsos positivos com ordinais ("1" → "01:00")
     // e com dígitos de datas ("30/06" → "06:00")
@@ -2602,7 +2638,9 @@ public class AssistantConversationService {
 
     signals.date = resolvedDate != null ? resolvedDate.toString() : null;
     signals.time = resolvedTime;
-    signals.detected = bookingIntent && (signals.serviceId != null || signals.serviceName != null || signals.date != null || signals.time != null);
+    signals.detected = bookingIntent && (signals.serviceId != null || signals.serviceName != null
+        || signals.professionalId != null || signals.professionalName != null
+        || signals.date != null || signals.time != null);
     return signals;
   }
 
@@ -2683,6 +2721,8 @@ public class AssistantConversationService {
     private boolean detected;
     private String serviceId;
     private String serviceName;
+    private String professionalId;
+    private String professionalName;
     private String date;
     private String time;
   }
