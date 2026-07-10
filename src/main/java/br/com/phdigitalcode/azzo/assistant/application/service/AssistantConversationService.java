@@ -229,6 +229,14 @@ public class AssistantConversationService {
       return shortcutReply;
     }
 
+    // Confirmação de agendamento tratada deterministicamente (sem LLM), garantindo
+    // a pergunta detalhada ("Deseja confirmar ... com <profissional> no dia <data> as <hora>?")
+    // e criação apenas após o "sim" do cliente.
+    String confirmationReply = handleAgentBookingConfirmationFlow(data, rawMessage, normalized, userIdentifier, tenantId);
+    if (confirmationReply != null) {
+      return confirmationReply;
+    }
+
     // Resolve datas relativas em Java antes de enviar ao LLM (modelos 8B erram esse cálculo)
     String contextualMessage = contextualizeAgentSelection(data, rawMessage, normalized);
     contextualMessage = appendBookingContextForAgent(data, contextualMessage, bookingLead);
@@ -2439,6 +2447,86 @@ public class AssistantConversationService {
 
   private String preferredPeriodLabel(ConversationData data) {
     return data != null && data.preferredPeriod != null ? data.preferredPeriod.label() : "esse período";
+  }
+
+  /**
+   * Trata deterministicamente as duas últimas etapas do agendamento — seleção de
+   * horário e confirmação — sem depender do LLM. Isso garante que a pergunta de
+   * confirmação sempre traga o resumo completo (serviço, profissional, data e hora)
+   * e que o agendamento só seja criado após o "sim" explícito do cliente.
+   *
+   * Retorna {@code null} quando não há nada a interceptar (deixa o LLM assumir).
+   */
+  private String handleAgentBookingConfirmationFlow(
+      ConversationData data,
+      String rawMessage,
+      String normalized,
+      String userIdentifier,
+      String tenantId) {
+    if (rawMessage == null || rawMessage.isBlank()) {
+      return null;
+    }
+
+    boolean coreSlotsReady = data.serviceId != null && data.professionalId != null && data.date != null;
+
+    // ── Etapa de confirmação: aguardando "sim"/"não" após a pergunta detalhada ──
+    if (data.stage == ConversationStage.CONFIRMATION && coreSlotsReady && data.time != null) {
+      if (isAffirmativeResponse(rawMessage)) {
+        LlmBookingAgent.AgentAction synthetic =
+            new LlmBookingAgent.AgentAction("CRIAR_AGENDAMENTO", java.util.Map.of());
+        String toolResult = executeCriarAgendamento(synthetic, data, userIdentifier, tenantId);
+        return buildDeterministicBookingConfirmationReply(data, toolResult);
+      }
+      if (DateTimeRegexExtractor.isNegative(normalized) || isInformalNegative(normalized)) {
+        data.time = null;
+        data.stage = ConversationStage.ASK_TIME;
+        return "Sem problema! Qual horario voce prefere entao? 😊";
+      }
+      // Resposta ambígua (ex.: "na verdade prefiro 11h") — deixa o LLM interpretar.
+      return null;
+    }
+
+    // ── Seleção de horário da lista → pergunta de confirmação detalhada ─────────
+    if (coreSlotsReady && data.stage != ConversationStage.CONFIRMATION
+        && data.availableTimeOptions != null && !data.availableTimeOptions.isEmpty()) {
+      String selectedTime = resolveSelectedTimeFromList(data, rawMessage);
+      if (selectedTime != null) {
+        if (!domainService.isSlotAvailable(tenantId, data.professionalId, data.date, selectedTime, data.serviceId)) {
+          return buildUnavailableSelectedTimeReply(data, tenantId);
+        }
+        data.time = selectedTime;
+        data.stage = ConversationStage.CONFIRMATION;
+        String question = buildBookingConfirmationQuestion(data);
+        // Mantém o histórico do LLM coerente caso o próximo turno seja ambíguo
+        // (ex.: "na verdade prefiro 11h") e precise voltar para o agente.
+        data.chatHistory.add(new ChatMessage("user", rawMessage));
+        data.chatHistory.add(new ChatMessage("assistant", question));
+        trimChatHistory(data);
+        return question;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Resolve o horário escolhido pelo cliente dentre as opções listadas, aceitando
+   * tanto seleção ordinal ("2") quanto o horário literal ("10:30"). Retorna
+   * {@code null} se a mensagem não corresponder a nenhuma opção apresentada.
+   */
+  private String resolveSelectedTimeFromList(ConversationData data, String rawMessage) {
+    OptionalInt ordinal = parseOrdinalSelection(rawMessage, data.availableTimeOptions.size());
+    if (ordinal.isPresent()) {
+      return data.availableTimeOptions.get(ordinal.getAsInt());
+    }
+    Optional<String> literal = DateTimeRegexExtractor.extractTime(rawMessage);
+    if (literal.isPresent()) {
+      String normalizedTime = normalizeTime(literal.get());
+      if (data.availableTimeOptions.contains(normalizedTime)) {
+        return normalizedTime;
+      }
+    }
+    return null;
   }
 
   private String handleAgentDeterministicIntent(
