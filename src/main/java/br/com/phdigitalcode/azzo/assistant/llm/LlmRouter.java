@@ -315,17 +315,17 @@ public class LlmRouter {
     // ─── Chamadas brutas ao LLM ───────────────────────────────────────────────
 
     private LlmResponse callGroq(List<OllamaMessage> messages, CallOptions options) {
-        GroqChatRequest request = new GroqChatRequest();
+        OpenAiChatRequest request = new OpenAiChatRequest();
         request.model       = groqModel;
         request.messages    = messages;
         request.temperature = options.temperature();
         request.maxTokens   = resolveMaxTokens(options.maxTokens());
         request.topP        = 0.85;
         if (options.jsonMode()) {
-            request.responseFormat = new GroqChatRequest.ResponseFormat("json_object");
+            request.responseFormat = new OpenAiChatRequest.ResponseFormat("json_object");
         }
 
-        GroqChatResponse response = groqClient.chat("Bearer " + groqApiKey, request);
+        OpenAiChatResponse response = groqClient.chat("Bearer " + groqApiKey, request);
         String text = response.text();
         if (text == null || text.isBlank()) throw new IllegalStateException("Groq retornou resposta vazia");
 
@@ -335,21 +335,23 @@ public class LlmRouter {
     }
 
     private LlmResponse callOllama(List<OllamaMessage> messages, CallOptions options) {
-        OllamaChatRequest request = new OllamaChatRequest();
-        request.model    = ollamaModel;
-        request.messages = messages;
-        request.stream   = false;
-        request.options  = new OllamaOptions(options.temperature(), resolveMaxTokens(options.maxTokens()));
+        OpenAiChatRequest request = new OpenAiChatRequest();
+        request.model       = ollamaModel;
+        request.messages    = messages;
+        request.stream      = false;
+        request.temperature = options.temperature();
+        request.maxTokens   = resolveMaxTokens(options.maxTokens());
         if (options.jsonMode()) {
-            request.format = "json";
+            request.responseFormat = new OpenAiChatRequest.ResponseFormat("json_object");
         }
 
-        OllamaChatResponse response = ollamaClient.chat(request);
-        if (response == null || response.message == null || response.message.content == null) {
+        OpenAiChatResponse response = ollamaClient.chat(request);
+        String text = response != null ? response.text() : null;
+        if (text == null || text.isBlank()) {
             throw new IllegalStateException("Ollama retornou resposta nula");
         }
-        LOG.debugf("[LlmRouter] Ollama respondeu (%d chars)", response.message.content.length());
-        return new LlmResponse(response.message.content.trim(), Provider.OLLAMA);
+        LOG.debugf("[LlmRouter] Ollama respondeu (%d chars)", text.length());
+        return new LlmResponse(text.trim(), Provider.OLLAMA);
     }
 
     private int resolveMaxTokens(Integer requestedMaxTokens) {

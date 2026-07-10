@@ -20,7 +20,7 @@ public interface GroqRestClient {
 
     @POST
     @Path("/openai/v1/chat/completions")
-    GroqChatResponse chat(
+    OpenAiChatResponse chat(
             @HeaderParam("Authorization") String authorization,
-            GroqChatRequest request);
+            OpenAiChatRequest request);
 }

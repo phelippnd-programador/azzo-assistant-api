@@ -58,8 +58,10 @@ class LlmRouterUnitTest {
                 + "tokens per minute exceeded. Please try again in 710ms. "
                 + "Code: rate_limit_exceeded"));
 
-    OllamaChatResponse ollamaResponse = new OllamaChatResponse();
-    ollamaResponse.message = new OllamaMessage("assistant", "fallback ok");
+    OpenAiChatResponse ollamaResponse = new OpenAiChatResponse();
+    OpenAiChatResponse.Choice choice = new OpenAiChatResponse.Choice();
+    choice.message = new OllamaMessage("assistant", "fallback ok");
+    ollamaResponse.choices = List.of(choice);
     when(ollamaClient.chat(any())).thenReturn(ollamaResponse);
 
     LlmRouter.LlmResponse response = router.call(

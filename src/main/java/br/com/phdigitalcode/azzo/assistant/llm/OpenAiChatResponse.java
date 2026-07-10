@@ -4,10 +4,11 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import java.util.List;
 
 /**
- * Response da API do Groq (formato OpenAI).
+ * Response no formato OpenAI-compatible, compartilhado entre Groq e o
+ * runtime local (llama.cpp server e equivalentes).
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
-public class GroqChatResponse {
+public class OpenAiChatResponse {
 
     public List<Choice> choices;
     public Usage usage;

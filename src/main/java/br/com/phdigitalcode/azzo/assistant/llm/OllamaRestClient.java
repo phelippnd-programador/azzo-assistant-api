@@ -8,8 +8,9 @@ import jakarta.ws.rs.core.MediaType;
 import org.eclipse.microprofile.rest.client.inject.RegisterRestClient;
 
 /**
- * REST client para a API do Ollama.
- * Configuração: quarkus.rest-client.ollama.url=http://localhost:11434
+ * REST client para o runtime LLM local, hoje um servidor llama.cpp
+ * OpenAI-compatible (/chat/completions) — trocado do formato nativo do
+ * Ollama (/api/chat). Configuração: quarkus.rest-client.ollama.url
  */
 @Path("/")
 @RegisterRestClient(configKey = "ollama")
@@ -18,6 +19,6 @@ import org.eclipse.microprofile.rest.client.inject.RegisterRestClient;
 public interface OllamaRestClient {
 
     @POST
-    @Path("/api/chat")
-    OllamaChatResponse chat(OllamaChatRequest request);
+    @Path("/chat/completions")
+    OpenAiChatResponse chat(OpenAiChatRequest request);
 }
