@@ -4,7 +4,6 @@ import java.util.List;
 import java.util.Optional;
 
 import org.eclipse.microprofile.config.inject.ConfigProperty;
-import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -14,9 +13,10 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 /**
- * Extrai slots de linguagem natural usando Ollama como fallback.
- * Chamado SOMENTE quando os extratores determinísticos (OpenNLP, regex) falham.
- * Sempre retorna Optional.empty() em caso de falha — nunca lança exceção.
+ * Extrai slots de linguagem natural via LLM (Ollama, com fallback pro Groq
+ * pelo LlmRouter) como fallback. Chamado SOMENTE quando os extratores
+ * determinísticos (OpenNLP, regex) falham. Sempre retorna Optional.empty()
+ * em caso de falha — nunca lança exceção.
  */
 @ApplicationScoped
 public class OllamaSlotExtractor {
@@ -24,17 +24,13 @@ public class OllamaSlotExtractor {
     private static final Logger LOG = Logger.getLogger(OllamaSlotExtractor.class);
 
     @Inject
-    @RestClient
-    OllamaRestClient ollamaRestClient;
+    LlmRouter llmRouter;
 
     @Inject
     ObjectMapper objectMapper;
 
     @ConfigProperty(name = "assistant.ollama.enabled", defaultValue = "false")
     boolean enabled;
-
-    @ConfigProperty(name = "assistant.ollama.model", defaultValue = "gemma2:2b")
-    String model;
 
     /**
      * Identifica qual serviço o usuário mencionou comparando com a lista disponível.
@@ -63,22 +59,17 @@ public class OllamaSlotExtractor {
                 Lista de serviços disponíveis: %s
                 """.formatted(String.join(", ", availableServices));
 
-            OllamaChatRequest request = new OllamaChatRequest();
-            request.model = model;
-            request.stream = false;
-            request.format = "json";
-            request.options = new OllamaOptions(0.0, 20);
-            request.messages = List.of(
+            List<OllamaMessage> messages = List.of(
                 new OllamaMessage("system", systemPrompt),
                 new OllamaMessage("user", message)
             );
-
-            OllamaChatResponse response = ollamaRestClient.chat(request);
-            if (response == null || response.message == null || response.message.content == null) {
+            LlmRouter.LlmResponse response = llmRouter.callStructured(
+                LlmRouter.Provider.OLLAMA, messages, 0.0, 20, true);
+            if (response.isError()) {
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.message.content);
+            JsonNode node = objectMapper.readTree(response.text());
             JsonNode serviceNode = node.path("service");
             if (serviceNode.isNull() || serviceNode.isMissingNode()) {
                 return Optional.empty();
@@ -140,22 +131,17 @@ public class OllamaSlotExtractor {
                 Profissionais disponíveis: %s
                 """.formatted(String.join(", ", availableProfessionals));
 
-            OllamaChatRequest request = new OllamaChatRequest();
-            request.model = model;
-            request.stream = false;
-            request.format = "json";
-            request.options = new OllamaOptions(0.0, 20);
-            request.messages = List.of(
+            List<OllamaMessage> messages = List.of(
                 new OllamaMessage("system", systemPrompt),
                 new OllamaMessage("user", message)
             );
-
-            OllamaChatResponse response = ollamaRestClient.chat(request);
-            if (response == null || response.message == null || response.message.content == null) {
+            LlmRouter.LlmResponse response = llmRouter.callStructured(
+                LlmRouter.Provider.OLLAMA, messages, 0.0, 20, true);
+            if (response.isError()) {
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.message.content);
+            JsonNode node = objectMapper.readTree(response.text());
             JsonNode profNode = node.path("professional");
             if (profNode.isNull() || profNode.isMissingNode()) {
                 return Optional.empty();
@@ -215,22 +201,17 @@ public class OllamaSlotExtractor {
                 - null: mensagem ambígua ou fora de contexto de confirmação
                 """;
 
-            OllamaChatRequest request = new OllamaChatRequest();
-            request.model = model;
-            request.stream = false;
-            request.format = "json";
-            request.options = new OllamaOptions(0.0, 15);
-            request.messages = List.of(
+            List<OllamaMessage> messages = List.of(
                 new OllamaMessage("system", systemPrompt),
                 new OllamaMessage("user", message)
             );
-
-            OllamaChatResponse response = ollamaRestClient.chat(request);
-            if (response == null || response.message == null || response.message.content == null) {
+            LlmRouter.LlmResponse response = llmRouter.callStructured(
+                LlmRouter.Provider.OLLAMA, messages, 0.0, 15, true);
+            if (response.isError()) {
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.message.content);
+            JsonNode node = objectMapper.readTree(response.text());
             JsonNode confirmedNode = node.path("confirmed");
             if (confirmedNode.isNull() || confirmedNode.isMissingNode()) {
                 return Optional.empty();
@@ -285,22 +266,17 @@ public class OllamaSlotExtractor {
                 - null: não consegue determinar ou mensagem ambígua
                 """;
 
-            OllamaChatRequest request = new OllamaChatRequest();
-            request.model = model;
-            request.stream = false;
-            request.format = "json";
-            request.options = new OllamaOptions(0.0, 15);
-            request.messages = List.of(
+            List<OllamaMessage> messages = List.of(
                 new OllamaMessage("system", systemPrompt),
                 new OllamaMessage("user", message)
             );
-
-            OllamaChatResponse response = ollamaRestClient.chat(request);
-            if (response == null || response.message == null || response.message.content == null) {
+            LlmRouter.LlmResponse response = llmRouter.callStructured(
+                LlmRouter.Provider.OLLAMA, messages, 0.0, 15, true);
+            if (response.isError()) {
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.message.content);
+            JsonNode node = objectMapper.readTree(response.text());
             JsonNode periodNode = node.path("period");
             if (periodNode.isNull() || periodNode.isMissingNode()) {
                 return Optional.empty();

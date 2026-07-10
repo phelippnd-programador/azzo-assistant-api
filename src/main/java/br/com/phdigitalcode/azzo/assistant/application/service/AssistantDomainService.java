@@ -137,28 +137,27 @@ public class AssistantDomainService {
     ServiceIntentContext intent = buildServiceIntentContext(candidate);
     StringBuilder sb = new StringBuilder();
     if (customerName != null && !customerName.isBlank()) {
-      sb.append("Entendi, ").append(customerName).append(". ");
+      sb.append("Oi, ").append(customerName).append("! ");
     } else {
-      sb.append("Entendi. ");
+      sb.append("Oi! ");
     }
-    sb.append("Nao consegui identificar exatamente o servico");
+    sb.append("Não consegui saber certinho qual serviço você quer");
     if (!intent.humanLabel().isBlank()) {
-      sb.append(" que voce quer");
-      sb.append(", mas pelo que voce descreveu parece algo de ").append(intent.humanLabel());
+      sb.append(", mas pelo que você descreveu parece ser algo de ").append(intent.humanLabel());
     }
-    sb.append(". Tenho estas opcoes:\n");
+    sb.append(". Dá uma olhada se é um destes:\n");
 
     int idx = 1;
     for (ServicoDto s : services.stream().limit(5).toList()) {
       sb.append("\n").append(idx++).append(" - ").append(s.name);
-      if (s.price > 0) sb.append(" — R$ ").append(String.format(Locale.ROOT, "%.2f", s.price / 100.0).replace('.', ','));
+      if (s.price > 0) sb.append(" — R$ ").append(String.format(Locale.ROOT, "%.2f", s.price).replace('.', ','));
       if (s.duration > 0) sb.append(" | ").append(formatDurationMinutes(s.duration));
       if (s.description != null && !s.description.isBlank()) {
         sb.append("\n   ").append(s.description.trim());
       }
     }
 
-    sb.append("\n\nSe for um destes, me manda o numero ou o nome. Se nao, me descreve um pouco melhor.");
+    sb.append("\n\nMe manda o número ou o nome que bate certinho. Se não for nenhum desses, me conta um pouco mais que eu te ajudo! 😊");
     return sb.toString();
   }
 

@@ -5,7 +5,6 @@ import java.util.List;
 import java.util.Optional;
 
 import org.eclipse.microprofile.config.inject.ConfigProperty;
-import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -15,9 +14,10 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 /**
- * Extrai datas em linguagem natural usando Ollama.
- * Usado como fallback quando o DateTimeRegexExtractor retorna empty().
- * Sempre retorna Optional.empty() em caso de erro — nunca lança exceção.
+ * Extrai datas em linguagem natural via LLM (Ollama, com fallback pro Groq
+ * pelo LlmRouter). Usado como fallback quando o DateTimeRegexExtractor
+ * retorna empty(). Sempre retorna Optional.empty() em caso de erro — nunca
+ * lança exceção.
  */
 @ApplicationScoped
 public class OllamaDateEnricher {
@@ -25,8 +25,7 @@ public class OllamaDateEnricher {
     private static final Logger LOG = Logger.getLogger(OllamaDateEnricher.class);
 
     @Inject
-    @RestClient
-    OllamaRestClient ollamaRestClient;
+    LlmRouter llmRouter;
 
     @Inject
     ObjectMapper objectMapper;
@@ -67,22 +66,17 @@ public class OllamaDateEnricher {
                 - Se não houver data, responda {"date": null}
                 """.formatted(today, today, today.plusDays(1));
 
-            OllamaChatRequest request = new OllamaChatRequest();
-            request.model = model;
-            request.stream = false;
-            request.format = "json";
-            request.options = new OllamaOptions(0.0, 30);
-            request.messages = List.of(
+            List<OllamaMessage> messages = List.of(
                 new OllamaMessage("system", systemPrompt),
                 new OllamaMessage("user", rawMessage)
             );
-
-            OllamaChatResponse response = ollamaRestClient.chat(request);
-            if (response == null || response.message == null || response.message.content == null) {
+            LlmRouter.LlmResponse response = llmRouter.callStructured(
+                LlmRouter.Provider.OLLAMA, messages, 0.0, 30, true);
+            if (response.isError()) {
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.message.content);
+            JsonNode node = objectMapper.readTree(response.text());
             JsonNode dateNode = node.path("date");
             if (dateNode.isNull() || dateNode.isMissingNode()) {
                 return Optional.empty();

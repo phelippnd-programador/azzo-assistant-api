@@ -159,10 +159,32 @@ public class LlmRouter {
             String systemPrompt,
             List<OllamaMessage> messages,
             Integer maxTokens) {
+        CallOptions options = new CallOptions(0.2, maxTokens, false);
         if (provider == Provider.GROQ) {
-            return callGroqWithFallback(messages, maxTokens);
+            return callGroqWithFallback(messages, options);
         } else {
-            return callOllamaWithFallback(messages, maxTokens);
+            return callOllamaWithFallback(messages, options);
+        }
+    }
+
+    /**
+     * Chamada estruturada (classificação/extração) com fallback bidirecional e
+     * circuit breaker, iguais ao {@link #call}. Usada pelos extratores que hoje
+     * chamam {@code OllamaRestClient} direto (sem CB nem fallback pro Groq) —
+     * essa é a variante que preserva temperatura baixa e o modo JSON que esses
+     * extratores exigem.
+     */
+    public LlmResponse callStructured(
+            Provider provider,
+            List<OllamaMessage> messages,
+            double temperature,
+            int maxTokens,
+            boolean jsonMode) {
+        CallOptions options = new CallOptions(temperature, maxTokens, jsonMode);
+        if (provider == Provider.GROQ) {
+            return callGroqWithFallback(messages, options);
+        } else {
+            return callOllamaWithFallback(messages, options);
         }
     }
 
@@ -191,14 +213,14 @@ public class LlmRouter {
     /**
      * Tenta Groq. Se o circuito estiver ABERTO ou a chamada falhar, faz fallback para Ollama.
      */
-    private LlmResponse callGroqWithFallback(List<OllamaMessage> messages, Integer maxTokens) {
+    private LlmResponse callGroqWithFallback(List<OllamaMessage> messages, CallOptions options) {
         if (groqCircuitState() == CbState.OPEN || isGroqRateLimitCooldownActive()) {
             LOG.debugf("[CB-Groq] Circuito ABERTO — indo direto ao Ollama");
-            return callOllamaDirectOrError(messages, maxTokens);
+            return callOllamaDirectOrError(messages, options);
         }
 
         try {
-            LlmResponse response = callGroq(messages, maxTokens);
+            LlmResponse response = callGroq(messages, options);
             onGroqSuccess();
             return response;
         } catch (Exception e) {
@@ -209,28 +231,28 @@ public class LlmRouter {
             }
             LOG.warnf("[LlmRouter] Groq falhou (%s) — fallback para Ollama", e.getMessage());
             persistUsage(Provider.OLLAMA);
-            return callOllamaDirectOrError(messages, maxTokens);
+            return callOllamaDirectOrError(messages, options);
         }
     }
 
     /**
      * Tenta Ollama. Se o circuito estiver ABERTO ou a chamada falhar, faz fallback para Groq.
      */
-    private LlmResponse callOllamaWithFallback(List<OllamaMessage> messages, Integer maxTokens) {
+    private LlmResponse callOllamaWithFallback(List<OllamaMessage> messages, CallOptions options) {
         if (ollamaCircuitState() == CbState.OPEN) {
             LOG.debugf("[CB-Ollama] Circuito ABERTO — indo direto ao Groq");
-            return callGroqDirectOrError(messages, maxTokens);
+            return callGroqDirectOrError(messages, options);
         }
 
         try {
-            LlmResponse response = callOllama(messages, maxTokens);
+            LlmResponse response = callOllama(messages, options);
             onOllamaSuccess();
             persistUsage(Provider.OLLAMA);
             return response;
         } catch (Exception e) {
             onOllamaFailure(e.getMessage());
             LOG.warnf("[LlmRouter] Ollama falhou (%s) — fallback para Groq", e.getMessage());
-            return callGroqDirectOrError(messages, maxTokens);
+            return callGroqDirectOrError(messages, options);
         }
     }
 
@@ -238,7 +260,7 @@ public class LlmRouter {
      * Chama Groq diretamente (sem re-tentar Ollama) — usado como destino de fallback.
      * Se Groq também estiver indisponível, retorna erro amigável.
      */
-    private LlmResponse callGroqDirectOrError(List<OllamaMessage> messages, Integer maxTokens) {
+    private LlmResponse callGroqDirectOrError(List<OllamaMessage> messages, CallOptions options) {
         if (!groqEnabled || groqApiKey.isBlank()) {
             LOG.warn("[LlmRouter] Groq não está habilitado — ambos providers indisponíveis");
             return LlmResponse.error();
@@ -248,7 +270,7 @@ public class LlmRouter {
             return LlmResponse.error();
         }
         try {
-            LlmResponse response = callGroq(messages, maxTokens);
+            LlmResponse response = callGroq(messages, options);
             onGroqSuccess();
             persistUsage(Provider.GROQ);
             LOG.infof("[LlmRouter] Groq assumiu como fallback do Ollama");
@@ -268,7 +290,7 @@ public class LlmRouter {
      * Chama Ollama diretamente (sem re-tentar Groq) — usado como destino de fallback.
      * Se Ollama também estiver indisponível, retorna erro amigável.
      */
-    private LlmResponse callOllamaDirectOrError(List<OllamaMessage> messages, Integer maxTokens) {
+    private LlmResponse callOllamaDirectOrError(List<OllamaMessage> messages, CallOptions options) {
         if (!ollamaEnabled) {
             LOG.warn("[LlmRouter] Ollama não está habilitado — ambos providers indisponíveis");
             return LlmResponse.error();
@@ -278,7 +300,7 @@ public class LlmRouter {
             return LlmResponse.error();
         }
         try {
-            LlmResponse response = callOllama(messages, maxTokens);
+            LlmResponse response = callOllama(messages, options);
             onOllamaSuccess();
             persistUsage(Provider.OLLAMA);
             LOG.infof("[LlmRouter] Ollama assumiu como fallback do Groq");
@@ -292,14 +314,16 @@ public class LlmRouter {
 
     // ─── Chamadas brutas ao LLM ───────────────────────────────────────────────
 
-    private LlmResponse callGroq(List<OllamaMessage> messages, Integer maxTokens) {
-        int effectiveMaxTokens = resolveMaxTokens(maxTokens);
+    private LlmResponse callGroq(List<OllamaMessage> messages, CallOptions options) {
         GroqChatRequest request = new GroqChatRequest();
         request.model       = groqModel;
         request.messages    = messages;
-        request.temperature = 0.2;
-        request.maxTokens   = effectiveMaxTokens;
+        request.temperature = options.temperature();
+        request.maxTokens   = resolveMaxTokens(options.maxTokens());
         request.topP        = 0.85;
+        if (options.jsonMode()) {
+            request.responseFormat = new GroqChatRequest.ResponseFormat("json_object");
+        }
 
         GroqChatResponse response = groqClient.chat("Bearer " + groqApiKey, request);
         String text = response.text();
@@ -310,13 +334,15 @@ public class LlmRouter {
         return new LlmResponse(text.trim(), Provider.GROQ);
     }
 
-    private LlmResponse callOllama(List<OllamaMessage> messages, Integer maxTokens) {
-        int effectiveMaxTokens = resolveMaxTokens(maxTokens);
+    private LlmResponse callOllama(List<OllamaMessage> messages, CallOptions options) {
         OllamaChatRequest request = new OllamaChatRequest();
         request.model    = ollamaModel;
         request.messages = messages;
         request.stream   = false;
-        request.options  = new OllamaOptions(0.2, effectiveMaxTokens);
+        request.options  = new OllamaOptions(options.temperature(), resolveMaxTokens(options.maxTokens()));
+        if (options.jsonMode()) {
+            request.format = "json";
+        }
 
         OllamaChatResponse response = ollamaClient.chat(request);
         if (response == null || response.message == null || response.message.content == null) {
@@ -485,4 +511,6 @@ public class LlmRouter {
         public boolean isError() { return text == null || text.isBlank(); }
         public static LlmResponse error() { return new LlmResponse(null, null); }
     }
+
+    private record CallOptions(double temperature, Integer maxTokens, boolean jsonMode) {}
 }

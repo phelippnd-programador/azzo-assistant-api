@@ -14,5 +14,13 @@ public class OllamaChatRequest {
     /** "json" para forçar output estruturado. Null omitido via @JsonInclude. */
     public String format;
 
+    /**
+     * Desliga o modo de raciocínio (chain-of-thought) em modelos que suportam
+     * "thinking" (ex.: DeepSeek-R1, QwQ, Qwen3). Sem efeito em modelos que não
+     * suportam a flag (ex.: llama3.2), mas evita tokens de raciocínio ocultos
+     * consumindo tempo/contexto à toa caso o modelo mude no futuro.
+     */
+    public boolean think = false;
+
     public OllamaOptions options;
 }

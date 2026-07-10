@@ -1,11 +1,12 @@
 package br.com.phdigitalcode.azzo.assistant.llm;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 
 import org.eclipse.microprofile.config.inject.ConfigProperty;
-import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
 
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ProfissionalDto;
@@ -14,12 +15,18 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 /**
- * Gera respostas humanizadas usando Ollama.
+ * Gera respostas humanizadas via LLM (Ollama, com fallback pro Groq pelo
+ * LlmRouter).
  *
  * REGRA DE SEGURANÇA: o LLM NUNCA gera dados vindos da API (preços, nomes,
  * especialidades, horários). Ele gera apenas o intro/saudação conversacional.
  * Os dados são sempre montados em Java a partir dos DTOs retornados pela API.
  * Sempre retorna Optional.empty() em caso de falha — o chamador usa fallback hardcoded.
+ *
+ * As introduções curtas e de baixa variabilidade (saudação de 1 linha sem
+ * dados) são cacheadas em memória por um tempo curto — evita pagar uma
+ * chamada LLM inteira só para gerar "Oi Fulano! Aqui estão nossos serviços 😊"
+ * de novo para o mesmo (nome, contexto).
  */
 @ApplicationScoped
 public class OllamaResponseService {
@@ -34,9 +41,11 @@ public class OllamaResponseService {
             Máximo 1 linha. 1 emoji. Português do Brasil informal.
             """;
 
+    private static final long CACHE_TTL_MS = 10 * 60 * 1000L; // 10 minutos
+    private static final int CACHE_MAX_ENTRIES = 200;
+
     @Inject
-    @RestClient
-    OllamaRestClient ollamaRestClient;
+    LlmRouter llmRouter;
 
     @ConfigProperty(name = "assistant.ollama.enabled", defaultValue = "false")
     boolean enabled;
@@ -44,8 +53,18 @@ public class OllamaResponseService {
     @ConfigProperty(name = "assistant.ollama.response.enabled", defaultValue = "true")
     boolean responseEnabled;
 
-    @ConfigProperty(name = "assistant.ollama.model", defaultValue = "gemma2:2b")
-    String model;
+    private record CacheEntry(String value, long expiresAt) {
+        boolean isExpired() { return System.currentTimeMillis() > expiresAt; }
+    }
+
+    /** LRU simples e thread-safe: mais antigo/menos usado sai primeiro ao passar de CACHE_MAX_ENTRIES. */
+    private final Map<String, CacheEntry> introCache = java.util.Collections.synchronizedMap(
+        new LinkedHashMap<>(64, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, CacheEntry> eldest) {
+                return size() > CACHE_MAX_ENTRIES;
+            }
+        });
 
     /**
      * Gera listagem de serviços com preço, duração e descrição.
@@ -75,7 +94,8 @@ public class OllamaResponseService {
                 + " para apresentar a lista de serviços do salão. "
                 + "NÃO mencione preços, nomes de serviços ou números. Apenas a saudação.";
 
-        Optional<String> intro = callOllama(introPrompt, INTRO_SYSTEM_PROMPT, 40);
+        String cacheKey = "services_intro:" + (firstName != null ? firstName : "_");
+        Optional<String> intro = callOllamaCached(cacheKey, introPrompt, INTRO_SYSTEM_PROMPT, 40);
         if (intro.isEmpty()) return Optional.empty();
 
         String introText = safeIntro(intro.get(), firstName != null
@@ -116,7 +136,8 @@ public class OllamaResponseService {
                 + " para apresentar os profissionais disponíveis para " + serviceName + ". "
                 + "NÃO mencione nomes, especialidades ou números. Apenas a saudação.";
 
-        Optional<String> intro = callOllama(introPrompt, INTRO_SYSTEM_PROMPT, 40);
+        String cacheKey = "professionals_intro:" + (firstName != null ? firstName : "_") + ":" + serviceName;
+        Optional<String> intro = callOllamaCached(cacheKey, introPrompt, INTRO_SYSTEM_PROMPT, 40);
         if (intro.isEmpty()) return Optional.empty();
 
         String introText = safeIntro(intro.get(), firstName != null
@@ -160,34 +181,45 @@ public class OllamaResponseService {
                 + "Gere uma mensagem curta, empática e simpática oferecendo transferência para um atendente humano. "
                 + "Instrua o cliente a responder SIM para ser atendido por uma pessoa.";
 
-        return callOllama(userPrompt, null, 80);
+        // Conteúdo 100% estático (sem dados variáveis) — chave de cache fixa.
+        return callOllamaCached("handoff", userPrompt, null, 80);
     }
 
     // ─── Infra ────────────────────────────────────────────────────────────────
+
+    /** Como {@link #callOllama}, mas memoiza o resultado por CACHE_TTL_MS sob a chave dada. */
+    private Optional<String> callOllamaCached(String cacheKey, String userPrompt, String systemOverride, int maxTokens) {
+        CacheEntry cached = introCache.get(cacheKey);
+        if (cached != null && !cached.isExpired()) {
+            LOG.debugf("[OllamaResponse] Cache hit: %s", cacheKey);
+            return Optional.of(cached.value());
+        }
+
+        Optional<String> generated = callOllama(userPrompt, systemOverride, maxTokens);
+        generated.ifPresent(value ->
+            introCache.put(cacheKey, new CacheEntry(value, System.currentTimeMillis() + CACHE_TTL_MS)));
+        return generated;
+    }
 
     private Optional<String> callOllama(String userPrompt, String systemOverride, int maxTokens) {
         long start = System.currentTimeMillis();
         try {
             String systemPrompt = systemOverride != null ? systemOverride : BASE_SYSTEM_PROMPT;
-            OllamaChatRequest request = new OllamaChatRequest();
-            request.model = model;
-            request.stream = false;
-            request.options = new OllamaOptions(0.5, maxTokens);
-            request.messages = List.of(
+            List<OllamaMessage> messages = List.of(
                     new OllamaMessage("system", systemPrompt),
                     new OllamaMessage("user", userPrompt));
 
-            OllamaChatResponse response = ollamaRestClient.chat(request);
+            LlmRouter.LlmResponse response = llmRouter.callStructured(
+                LlmRouter.Provider.OLLAMA, messages, 0.5, maxTokens, false);
             long elapsed = System.currentTimeMillis() - start;
 
-            if (response == null || response.message == null
-                    || response.message.content == null || response.message.content.isBlank()) {
+            if (response.isError()) {
                 LOG.warnf("[OllamaResponse] Resposta vazia após %dms", elapsed);
                 return Optional.empty();
             }
 
-            String content = cleanResponse(response.message.content);
-            LOG.infof("[OllamaResponse] Gerado em %dms (%d chars)", elapsed, content.length());
+            String content = cleanResponse(response.text());
+            LOG.infof("[OllamaResponse] Gerado em %dms (%d chars) provider=%s", elapsed, content.length(), response.provider());
             return Optional.of(content);
 
         } catch (Exception e) {

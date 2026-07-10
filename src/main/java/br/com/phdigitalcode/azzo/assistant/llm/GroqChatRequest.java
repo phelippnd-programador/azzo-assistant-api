@@ -19,4 +19,17 @@ public class GroqChatRequest {
 
     @JsonProperty("top_p")
     public Double topP;
+
+    @JsonProperty("response_format")
+    public ResponseFormat responseFormat;
+
+    public static class ResponseFormat {
+        public String type;
+
+        public ResponseFormat() {}
+
+        public ResponseFormat(String type) {
+            this.type = type;
+        }
+    }
 }

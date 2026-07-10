@@ -4,7 +4,6 @@ import java.util.List;
 import java.util.Optional;
 
 import org.eclipse.microprofile.config.inject.ConfigProperty;
-import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -49,8 +48,7 @@ public class OllamaIntentService {
         """;
 
     @Inject
-    @RestClient
-    OllamaRestClient ollamaRestClient;
+    LlmRouter llmRouter;
 
     @Inject
     ObjectMapper objectMapper;
@@ -77,30 +75,27 @@ public class OllamaIntentService {
         LOG.infof("[Ollama] Classificando intent para: '%s' (stage=%s, model=%s)", abbrev(message), currentStage, model);
         long start = System.currentTimeMillis();
         try {
-            OllamaChatRequest request = new OllamaChatRequest();
-            request.model = model;
-            request.stream = false;
-            request.format = "json";
-            request.options = new OllamaOptions(0.1, 60);
-            request.messages = List.of(
+            List<OllamaMessage> messages = List.of(
                 new OllamaMessage("system", SYSTEM_PROMPT + "\nEstágio atual: " + currentStage),
                 new OllamaMessage("user", message)
             );
 
-            OllamaChatResponse response = ollamaRestClient.chat(request);
+            LlmRouter.LlmResponse response = llmRouter.callStructured(
+                LlmRouter.Provider.OLLAMA, messages, 0.1, 60, true);
             long elapsed = System.currentTimeMillis() - start;
 
-            if (response == null || response.message == null || response.message.content == null) {
+            if (response.isError()) {
                 LOG.warnf("[Ollama] Resposta vazia após %dms", elapsed);
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.message.content);
+            JsonNode node = objectMapper.readTree(response.text());
             String intentStr = node.path("intent").asText("UNKNOWN");
             double confidence = node.path("confidence").asDouble(0.0);
             IntentType intentType = parseIntent(intentStr);
 
-            LOG.infof("[Ollama] Intent: %s conf=%.2f em %dms (raw='%s')", intentType, confidence, elapsed, response.message.content);
+            LOG.infof("[Ollama] Intent: %s conf=%.2f em %dms provider=%s (raw='%s')",
+                intentType, confidence, elapsed, response.provider(), response.text());
             return Optional.of(new IntentPrediction(intentType, confidence));
 
         } catch (Exception e) {
