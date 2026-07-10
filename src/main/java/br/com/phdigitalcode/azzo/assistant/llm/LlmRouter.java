@@ -64,9 +64,9 @@ public class LlmRouter {
 
     // ─── Injeções ─────────────────────────────────────────────────────────────
 
-    @Inject @RestClient OllamaRestClient ollamaClient;
-    @Inject @RestClient GroqRestClient   groqClient;
-    @Inject LlmUsageRepository           usageRepository;
+    @Inject @RestClient LocalLlmClient localLlmClient;
+    @Inject @RestClient GroqRestClient groqClient;
+    @Inject LlmUsageRepository         usageRepository;
 
     @ConfigProperty(name = "assistant.groq.api-key",    defaultValue = "")                     String  groqApiKey;
     @ConfigProperty(name = "assistant.groq.model",      defaultValue = "llama-3.1-8b-instant") String  groqModel;
@@ -75,6 +75,7 @@ public class LlmRouter {
     @ConfigProperty(name = "assistant.ollama.enabled",  defaultValue = "false")                boolean ollamaEnabled;
     @ConfigProperty(name = "assistant.ollama.model",    defaultValue = "azzo-assistant-llama32") String ollamaModel;
     @ConfigProperty(name = "assistant.llm.default-max-tokens", defaultValue = "300")           int     defaultMaxTokens;
+    @ConfigProperty(name = "assistant.llm.default-temperature", defaultValue = "0.2")          double  defaultTemperature;
     @ConfigProperty(name = "assistant.groq.rate-limit-cooldown-ms", defaultValue = "15000")    long    groqRateLimitCooldownMs;
 
     // ─── Estado: contador diário Groq (cache em memória) ─────────────────────
@@ -159,7 +160,7 @@ public class LlmRouter {
             String systemPrompt,
             List<OllamaMessage> messages,
             Integer maxTokens) {
-        CallOptions options = new CallOptions(0.2, maxTokens, false);
+        CallOptions options = new CallOptions(defaultTemperature, maxTokens, false);
         if (provider == Provider.GROQ) {
             return callGroqWithFallback(messages, options);
         } else {
@@ -224,23 +225,24 @@ public class LlmRouter {
             onGroqSuccess();
             return response;
         } catch (Exception e) {
+            String reason = describeFailure(e);
             if (isGroqRateLimitError(e.getMessage())) {
                 onGroqRateLimited(e.getMessage());
             } else {
-                onGroqFailure(e.getMessage());
+                onGroqFailure(reason);
             }
-            LOG.warnf("[LlmRouter] Groq falhou (%s) — fallback para Ollama", e.getMessage());
+            LOG.warnf("[LlmRouter] Groq falhou (%s) — fallback para LLM local", reason);
             persistUsage(Provider.OLLAMA);
             return callOllamaDirectOrError(messages, options);
         }
     }
 
     /**
-     * Tenta Ollama. Se o circuito estiver ABERTO ou a chamada falhar, faz fallback para Groq.
+     * Tenta o LLM local. Se o circuito estiver ABERTO ou a chamada falhar, faz fallback para Groq.
      */
     private LlmResponse callOllamaWithFallback(List<OllamaMessage> messages, CallOptions options) {
         if (ollamaCircuitState() == CbState.OPEN) {
-            LOG.debugf("[CB-Ollama] Circuito ABERTO — indo direto ao Groq");
+            LOG.debugf("[CB-LlamaCpp] Circuito ABERTO — indo direto ao Groq");
             return callGroqDirectOrError(messages, options);
         }
 
@@ -250,8 +252,9 @@ public class LlmRouter {
             persistUsage(Provider.OLLAMA);
             return response;
         } catch (Exception e) {
-            onOllamaFailure(e.getMessage());
-            LOG.warnf("[LlmRouter] Ollama falhou (%s) — fallback para Groq", e.getMessage());
+            String reason = describeFailure(e);
+            onOllamaFailure(reason);
+            LOG.warnf("[LlmRouter] LLM local falhou (%s) — fallback para Groq", reason);
             return callGroqDirectOrError(messages, options);
         }
     }
@@ -273,41 +276,43 @@ public class LlmRouter {
             LlmResponse response = callGroq(messages, options);
             onGroqSuccess();
             persistUsage(Provider.GROQ);
-            LOG.infof("[LlmRouter] Groq assumiu como fallback do Ollama");
+            LOG.infof("[LlmRouter] Groq assumiu como fallback do LLM local");
             return response;
         } catch (Exception e) {
+            String reason = describeFailure(e);
             if (isGroqRateLimitError(e.getMessage())) {
                 onGroqRateLimited(e.getMessage());
             } else {
-                onGroqFailure(e.getMessage());
+                onGroqFailure(reason);
             }
-            LOG.warnf("[LlmRouter] Groq também falhou como fallback (%s)", e.getMessage());
+            LOG.warnf("[LlmRouter] Groq também falhou como fallback (%s)", reason);
             return LlmResponse.error();
         }
     }
 
     /**
-     * Chama Ollama diretamente (sem re-tentar Groq) — usado como destino de fallback.
-     * Se Ollama também estiver indisponível, retorna erro amigável.
+     * Chama o LLM local diretamente (sem re-tentar Groq) — usado como destino de fallback.
+     * Se o LLM local também estiver indisponível, retorna erro amigável.
      */
     private LlmResponse callOllamaDirectOrError(List<OllamaMessage> messages, CallOptions options) {
         if (!ollamaEnabled) {
-            LOG.warn("[LlmRouter] Ollama não está habilitado — ambos providers indisponíveis");
+            LOG.warn("[LlmRouter] LLM local não está habilitado — ambos providers indisponíveis");
             return LlmResponse.error();
         }
         if (ollamaCircuitState() == CbState.OPEN) {
-            LOG.warn("[LlmRouter] CB-Ollama também ABERTO — ambos providers indisponíveis");
+            LOG.warn("[LlmRouter] CB-LlamaCpp também ABERTO — ambos providers indisponíveis");
             return LlmResponse.error();
         }
         try {
             LlmResponse response = callOllama(messages, options);
             onOllamaSuccess();
             persistUsage(Provider.OLLAMA);
-            LOG.infof("[LlmRouter] Ollama assumiu como fallback do Groq");
+            LOG.infof("[LlmRouter] LLM local assumiu como fallback do Groq");
             return response;
         } catch (Exception e) {
-            onOllamaFailure(e.getMessage());
-            LOG.warnf("[LlmRouter] Ollama também falhou como fallback (%s)", e.getMessage());
+            String reason = describeFailure(e);
+            onOllamaFailure(reason);
+            LOG.warnf("[LlmRouter] LLM local também falhou como fallback (%s)", reason);
             return LlmResponse.error();
         }
     }
@@ -326,32 +331,97 @@ public class LlmRouter {
         }
 
         OpenAiChatResponse response = groqClient.chat("Bearer " + groqApiKey, request);
-        String text = response.text();
+        String text = response != null ? response.text() : null;
         if (text == null || text.isBlank()) throw new IllegalStateException("Groq retornou resposta vazia");
 
-        int tokensUsed = response.usage != null ? response.usage.total_tokens : 0;
+        int tokensUsed = response.usage != null ? response.usage.totalTokens : 0;
         LOG.debugf("[LlmRouter] Groq respondeu (%d tokens)", tokensUsed);
         return new LlmResponse(text.trim(), Provider.GROQ);
     }
 
+    /**
+     * Chama o LLM local (llama.cpp server, OpenAI-compatible). Valida a
+     * resposta em cada nivel (objeto nulo, choices nulo/vazio, message nulo,
+     * conteudo vazio) para diferenciar exatamente onde a resposta veio
+     * incompleta — nunca lança NullPointerException.
+     */
     private LlmResponse callOllama(List<OllamaMessage> messages, CallOptions options) {
+        long start = System.currentTimeMillis();
         OpenAiChatRequest request = new OpenAiChatRequest();
         request.model       = ollamaModel;
         request.messages    = messages;
-        request.stream      = false;
+        request.stream      = false; // a aplicacao nao processa streaming
         request.temperature = options.temperature();
         request.maxTokens   = resolveMaxTokens(options.maxTokens());
         if (options.jsonMode()) {
             request.responseFormat = new OpenAiChatRequest.ResponseFormat("json_object");
         }
 
-        OpenAiChatResponse response = ollamaClient.chat(request);
-        String text = response != null ? response.text() : null;
-        if (text == null || text.isBlank()) {
-            throw new IllegalStateException("Ollama retornou resposta nula");
+        OpenAiChatResponse response = localLlmClient.chat(request);
+        long elapsedMs = System.currentTimeMillis() - start;
+
+        if (response == null) {
+            throw new IllegalStateException("resposta nula do LLM local");
         }
-        LOG.debugf("[LlmRouter] Ollama respondeu (%d chars)", text.length());
+        if (response.choices == null || response.choices.isEmpty()) {
+            LOG.warnf("[LlmRouter] LLM local: choices vazio/nulo (model=%s elapsedMs=%d)", ollamaModel, elapsedMs);
+            throw new IllegalStateException("lista 'choices' vazia na resposta do LLM local");
+        }
+        OpenAiChatResponse.Choice first = response.choices.get(0);
+        if (first == null || first.message == null) {
+            throw new IllegalStateException("'message' nula na resposta do LLM local");
+        }
+
+        String text = response.text();
+        if (text == null || text.isBlank()) {
+            LOG.warnf("[LlmRouter] LLM local: conteudo vazio (model=%s elapsedMs=%d finishReason=%s choices=%d)",
+                    ollamaModel, elapsedMs, first.finishReason, response.choiceCount());
+            throw new IllegalStateException("conteúdo vazio na resposta do LLM local");
+        }
+
+        LOG.infof("[LlmRouter] LLM local respondeu: model=%s elapsedMs=%d finishReason=%s "
+                        + "promptTokens=%d completionTokens=%d totalTokens=%d choices=%d",
+                ollamaModel, elapsedMs, first.finishReason,
+                response.usage != null ? response.usage.promptTokens : 0,
+                response.usage != null ? response.usage.completionTokens : 0,
+                response.usage != null ? response.usage.totalTokens : 0,
+                response.choiceCount());
         return new LlmResponse(text.trim(), Provider.OLLAMA);
+    }
+
+    /**
+     * Classifica a falha numa categoria legível (timeout, HTTP 4xx/5xx,
+     * conexão recusada, JSON inválido, ou uma das mensagens estruturais já
+     * lançadas por {@link #callOllama}) em vez de só repassar a exceção
+     * bruta — facilita diagnosticar rapidamente pelos logs qual das duas
+     * pontas (rede vs. formato de resposta) está falhando.
+     */
+    static String describeFailure(Exception e) {
+        if (e instanceof jakarta.ws.rs.WebApplicationException wae) {
+            int status = wae.getResponse() != null ? wae.getResponse().getStatus() : -1;
+            if (status >= 500) return "HTTP " + status + " (erro no servidor LLM)";
+            if (status >= 400) return "HTTP " + status + " (requisição rejeitada)";
+            return "HTTP " + status;
+        }
+
+        Throwable cause = e;
+        while (cause.getCause() != null && cause.getCause() != cause) {
+            cause = cause.getCause();
+        }
+        if (cause instanceof java.net.ConnectException) {
+            return "conexão recusada (" + cause.getMessage() + ")";
+        }
+        if (cause instanceof java.net.SocketTimeoutException
+                || cause instanceof java.util.concurrent.TimeoutException
+                || (e.getMessage() != null && e.getMessage().toLowerCase(java.util.Locale.ROOT).contains("timeout"))) {
+            return "timeout";
+        }
+        if (cause instanceof com.fasterxml.jackson.core.JsonProcessingException) {
+            return "JSON inválido na resposta (" + cause.getMessage() + ")";
+        }
+        // Mensagens estruturais ja legiveis lancadas por callOllama/callGroq
+        // (resposta nula, choices vazio, message nula, conteudo vazio, resposta vazia).
+        return e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
     }
 
     private int resolveMaxTokens(Integer requestedMaxTokens) {
@@ -413,7 +483,7 @@ public class LlmRouter {
 
     private synchronized void onOllamaSuccess() {
         if (ollamaCbFailures > 0) {
-            LOG.infof("[CB-Ollama] OK — circuito FECHADO (era %d falhas consecutivas)", ollamaCbFailures);
+            LOG.infof("[CB-LlamaCpp] OK — circuito FECHADO (era %d falhas consecutivas)", ollamaCbFailures);
             ollamaCbFailures = 0;
         }
     }
@@ -422,13 +492,13 @@ public class LlmRouter {
         ollamaCbFailures++;
         if (ollamaCbFailures == CB_FAILURE_THRESHOLD) {
             ollamaCbOpenedAt = System.currentTimeMillis();
-            LOG.warnf("[CB-Ollama] %d falhas — circuito ABERTO por %d min | %s",
+            LOG.warnf("[CB-LlamaCpp] %d falhas — circuito ABERTO por %d min | %s",
                     CB_FAILURE_THRESHOLD, CB_OPEN_DURATION_MIN, reason);
         } else if (ollamaCbFailures > CB_FAILURE_THRESHOLD) {
             ollamaCbOpenedAt = System.currentTimeMillis();
-            LOG.warnf("[CB-Ollama] Falhou em HALF-OPEN — ABERTO novamente | %s", reason);
+            LOG.warnf("[CB-LlamaCpp] Falhou em HALF-OPEN — ABERTO novamente | %s", reason);
         } else {
-            LOG.warnf("[CB-Ollama] Falha %d/%d | %s", ollamaCbFailures, CB_FAILURE_THRESHOLD, reason);
+            LOG.warnf("[CB-LlamaCpp] Falha %d/%d | %s", ollamaCbFailures, CB_FAILURE_THRESHOLD, reason);
         }
     }
 
