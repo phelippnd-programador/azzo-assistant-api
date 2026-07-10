@@ -277,7 +277,7 @@ public class AssistantConversationService {
     }
 
     // Processa ações — max 1 round-trip para evitar loops
-    String finalReply = processActions(result, data, userIdentifier, tenantId, systemPrompt);
+    String finalReply = processActions(result, data, rawMessage, userIdentifier, tenantId, systemPrompt);
 
     // Grava no histórico para próximos turnos (usa mensagem enriquecida para consistência)
     data.chatHistory.add(new ChatMessage("user", compactedMessage));
@@ -348,7 +348,7 @@ public class AssistantConversationService {
    * re-chama o LLM com o resultado injetado no contexto.
    */
   private String processActions(LlmBookingAgent.AgentResult result, ConversationData data,
-      String userIdentifier, String tenantId, String systemPrompt) {
+      String rawMessage, String userIdentifier, String tenantId, String systemPrompt) {
 
     if (result.actions().isEmpty()) {
       return result.text();
@@ -362,6 +362,15 @@ public class AssistantConversationService {
 
     LlmBookingAgent.AgentAction bookAction = result.firstAction("CRIAR_AGENDAMENTO");
     if (bookAction != null) {
+      // Trava determinística: o agendamento só é criado depois que o assistente
+      // perguntou "confirma?" e o cliente respondeu afirmativamente. Se o LLM
+      // pular essa etapa, seguramos a criação e fazemos a pergunta nós mesmos.
+      if (!(isConfirmationPending(data.chatHistory) && isAffirmativeResponse(rawMessage))) {
+        applyBookingActionSlots(bookAction, data, tenantId);
+        data.stage = ConversationStage.CONFIRMATION;
+        LOG.infof("[Agent] CRIAR_AGENDAMENTO sem confirmacao previa — pedindo confirmacao ao cliente");
+        return buildBookingConfirmationQuestion(data);
+      }
       String toolResult = executeCriarAgendamento(bookAction, data, userIdentifier, tenantId);
       return buildDeterministicBookingConfirmationReply(data, toolResult);
     }
@@ -397,6 +406,14 @@ public class AssistantConversationService {
       if (professionalId != null) data.professionalId = professionalId;
       if (serviceId != null) data.serviceId = serviceId;
       if (date != null) data.date = date;
+      if (profAlias != null) {
+        agentSystemPromptBuilder.resolveProfessionalName(tenantId, profAlias)
+            .ifPresent(name -> data.professionalName = name);
+      }
+      if (svcAlias != null) {
+        agentSystemPromptBuilder.resolveServiceName(tenantId, svcAlias)
+            .ifPresent(name -> data.serviceName = name);
+      }
 
       List<String> slots = domainService.suggestTimes(tenantId, professionalId, date, serviceId, null);
       if (slots.isEmpty()) {
@@ -456,28 +473,71 @@ public class AssistantConversationService {
     return reply.toString().trim();
   }
 
+  /**
+   * Copia para os slots da conversa tudo que a action do LLM trouxe (aliases
+   * resolvidos para UUID + nome real, data, horário e nome do cliente).
+   */
+  private void applyBookingActionSlots(LlmBookingAgent.AgentAction action,
+      ConversationData data, String tenantId) {
+    String profAlias = action.param("prof");
+    String svcAlias = action.param("svc");
+    String dateStr = action.param("date");
+    String time = action.param("time");
+    String customerName = action.param("customer");
+
+    if (profAlias != null) {
+      agentSystemPromptBuilder.resolveProfessionalId(tenantId, profAlias)
+          .ifPresent(id -> data.professionalId = id);
+      agentSystemPromptBuilder.resolveProfessionalName(tenantId, profAlias)
+          .ifPresent(name -> data.professionalName = name);
+    }
+    if (svcAlias != null) {
+      agentSystemPromptBuilder.resolveServiceId(tenantId, svcAlias)
+          .ifPresent(id -> data.serviceId = id);
+      agentSystemPromptBuilder.resolveServiceName(tenantId, svcAlias)
+          .ifPresent(name -> data.serviceName = name);
+    }
+    if (dateStr != null) {
+      try {
+        data.date = LocalDate.parse(dateStr);
+      } catch (java.time.format.DateTimeParseException e) {
+        LOG.warnf("[Agent] Data inválida na action do LLM: %s", dateStr);
+      }
+    }
+    if (time != null && !time.isBlank()) data.time = time;
+    if (customerName != null && !customerName.isBlank()) data.customerName = customerName.trim();
+  }
+
+  /**
+   * Pergunta de confirmação determinística, com o resumo completo do agendamento.
+   * Emitida sempre que o LLM tentar criar sem o cliente ter confirmado antes.
+   */
+  private String buildBookingConfirmationQuestion(ConversationData data) {
+    List<String> summary = new ArrayList<>();
+    if (data.serviceName != null && !data.serviceName.isBlank()) {
+      summary.add("de " + data.serviceName);
+    }
+    if (data.professionalName != null && !data.professionalName.isBlank()) {
+      summary.add("com " + data.professionalName);
+    }
+    if (data.date != null) {
+      summary.add("no dia " + formatDateBr(data.date));
+    }
+    if (data.time != null && !data.time.isBlank()) {
+      summary.add("as " + data.time);
+    }
+
+    if (summary.isEmpty()) {
+      return "Deseja confirmar o agendamento? E so responder sim que eu marco. 😊";
+    }
+    return "Deseja confirmar o agendamento " + String.join(" ", summary)
+        + "? E so responder sim que eu marco. 😊";
+  }
+
   private String executeCriarAgendamento(LlmBookingAgent.AgentAction action,
       ConversationData data, String userIdentifier, String tenantId) {
     try {
-      String profAlias = action.param("prof");
-      String svcAlias = action.param("svc");
-      String dateStr = action.param("date");
-      String time = action.param("time");
-      String customerName = action.param("customer");
-
-      UUID professionalId = profAlias != null
-          ? agentSystemPromptBuilder.resolveProfessionalId(tenantId, profAlias).orElse(data.professionalId)
-          : data.professionalId;
-      UUID serviceId = svcAlias != null
-          ? agentSystemPromptBuilder.resolveServiceId(tenantId, svcAlias).orElse(data.serviceId)
-          : data.serviceId;
-      LocalDate date = dateStr != null ? LocalDate.parse(dateStr) : data.date;
-
-      if (customerName != null && !customerName.isBlank()) data.customerName = customerName.trim();
-      if (professionalId != null) data.professionalId = professionalId;
-      if (serviceId != null) data.serviceId = serviceId;
-      if (date != null) data.date = date;
-      if (time != null && !time.isBlank()) data.time = time;
+      applyBookingActionSlots(action, data, tenantId);
 
       if (data.serviceId == null || data.professionalId == null || data.date == null || data.time == null) {
         return "Faltam informações para criar o agendamento (serviço, profissional, data ou horário).";

@@ -121,6 +121,16 @@ Os aliases S1, P1 etc. sao internos - nunca mostre ao cliente.
         }
     }
 
+    public Optional<String> resolveServiceName(String tenantId, String alias) {
+        CachedContext ctx = getOrBuild(tenantId);
+        return Optional.ofNullable(ctx.serviceAliasToName.get(alias.toUpperCase()));
+    }
+
+    public Optional<String> resolveProfessionalName(String tenantId, String alias) {
+        CachedContext ctx = getOrBuild(tenantId);
+        return Optional.ofNullable(ctx.professionalAliasToName.get(alias.toUpperCase()));
+    }
+
     /** Invalida o cache de um tenant (ex.: após atualização de serviços). */
     public void invalidate(String tenantId) {
         cache.remove(tenantId);
@@ -146,6 +156,8 @@ Os aliases S1, P1 etc. sao internos - nunca mostre ao cliente.
 
         Map<String, String> serviceAliasToId = new LinkedHashMap<>();
         Map<String, String> professionalAliasToId = new LinkedHashMap<>();
+        Map<String, String> serviceAliasToName = new LinkedHashMap<>();
+        Map<String, String> professionalAliasToName = new LinkedHashMap<>();
 
         StringBuilder sb = new StringBuilder();
 
@@ -210,6 +222,7 @@ Se o cliente pedir uma data anterior a hoje, recuse com naturalidade:
         for (ServicoDto s : services.stream().limit(15).toList()) {
             String alias = "S" + si++;
             serviceAliasToId.put(alias, s.id);
+            serviceAliasToName.put(alias, s.name);
             sb.append("[").append(alias).append("] ").append(s.name);
             if (s.price > 0) sb.append(" — R$").append(String.format(Locale.ROOT, "%.0f", s.price));
             if (s.duration > 0) sb.append(" | ").append(formatDuration(s.duration));
@@ -225,6 +238,7 @@ Se o cliente pedir uma data anterior a hoje, recuse com naturalidade:
         for (ProfissionalDto p : professionals.stream().limit(15).toList()) {
             String alias = "P" + pi++;
             professionalAliasToId.put(alias, p.id);
+            professionalAliasToName.put(alias, p.name);
             sb.append("[").append(alias).append("] ").append(p.name);
             if (p.specialtiesDetailed != null && !p.specialtiesDetailed.isEmpty()) {
                 String specs = p.specialtiesDetailed.stream()
@@ -286,7 +300,8 @@ Para cancelar um agendamento existente:
         LOG.infof("[AgentPrompt] Prompt construído para tenant=%s: %d serviços, %d profissionais",
                 tenantId, serviceAliasToId.size(), professionalAliasToId.size());
 
-        return new CachedContext(sb.toString(), serviceAliasToId, professionalAliasToId);
+        return new CachedContext(sb.toString(), serviceAliasToId, professionalAliasToId,
+                serviceAliasToName, professionalAliasToName);
     }
 
     private String fetchSalonName(String tenantId) {
@@ -377,13 +392,19 @@ Para cancelar um agendamento existente:
         final String systemPrompt;
         final Map<String, String> serviceAliasToId;
         final Map<String, String> professionalAliasToId;
+        final Map<String, String> serviceAliasToName;
+        final Map<String, String> professionalAliasToName;
         final Instant expiresAt;
 
         CachedContext(String systemPrompt, Map<String, String> serviceAliasToId,
-                Map<String, String> professionalAliasToId) {
+                Map<String, String> professionalAliasToId,
+                Map<String, String> serviceAliasToName,
+                Map<String, String> professionalAliasToName) {
             this.systemPrompt = systemPrompt;
             this.serviceAliasToId = serviceAliasToId;
             this.professionalAliasToId = professionalAliasToId;
+            this.serviceAliasToName = serviceAliasToName;
+            this.professionalAliasToName = professionalAliasToName;
             this.expiresAt = Instant.now().plusMillis(CACHE_TTL_MS);
         }
 
