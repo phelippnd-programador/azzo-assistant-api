@@ -5,6 +5,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import br.com.phdigitalcode.azzo.assistant.llm.OllamaMessage;
 import br.com.phdigitalcode.azzo.assistant.llm.OpenAiChatRequest;
 import br.com.phdigitalcode.azzo.assistant.llm.OpenAiChatResponse;
@@ -41,6 +44,11 @@ public class OpenAiCompatibleAdapter implements LlmProviderAdapter {
   private static final String DEFAULT_CHAT_ENDPOINT = "/chat/completions";
   private static final String MODELS_ENDPOINT = "/models";
 
+  // ObjectMapper próprio: serializa/desserializa como String, sem depender de um
+  // MessageBodyReader/Writer JSON registrado no client (funciona dentro e fora do Quarkus).
+  private static final ObjectMapper MAPPER = new ObjectMapper()
+      .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+
   @Override
   public LlmProviderType getProviderType() {
     return LlmProviderType.OPENAI_COMPATIBLE;
@@ -57,12 +65,14 @@ public class OpenAiCompatibleAdapter implements LlmProviderAdapter {
       WebTarget target = client.target(joinUrl(credential.urlBase(), endpoint));
       Invocation.Builder req = comHeaders(target.request(MediaType.APPLICATION_JSON_TYPE), credential);
 
-      try (Response resp = req.post(Entity.json(body))) {
+      String reqJson = serializar(body);
+      try (Response resp = req.post(Entity.entity(reqJson, MediaType.APPLICATION_JSON_TYPE))) {
         int status = resp.getStatus();
+        String corpo = resp.readEntity(String.class);
         if (status >= 400) {
-          throw erroHttp(resp, status);
+          throw erroHttp(status, resp.getHeaderString("Retry-After"), corpo);
         }
-        OpenAiChatResponse parsed = resp.readEntity(OpenAiChatResponse.class);
+        OpenAiChatResponse parsed = parsear(corpo, OpenAiChatResponse.class, status);
         String texto = parsed != null ? parsed.text() : null;
         if (texto == null || texto.isBlank()) {
           throw new LlmProviderException(status, null, "resposta vazia do provedor");
@@ -87,10 +97,12 @@ public class OpenAiCompatibleAdapter implements LlmProviderAdapter {
       WebTarget target = client.target(joinUrl(credential.urlBase(), MODELS_ENDPOINT));
       Invocation.Builder req = comHeaders(target.request(MediaType.APPLICATION_JSON_TYPE), credential);
       try (Response resp = req.get()) {
-        if (resp.getStatus() >= 400) {
-          throw erroHttp(resp, resp.getStatus());
+        int status = resp.getStatus();
+        String corpo = resp.readEntity(String.class);
+        if (status >= 400) {
+          throw erroHttp(status, resp.getHeaderString("Retry-After"), corpo);
         }
-        ModelsResponse parsed = resp.readEntity(ModelsResponse.class);
+        ModelsResponse parsed = parsear(corpo, ModelsResponse.class, status);
         List<LlmModelInfo> modelos = new ArrayList<>();
         if (parsed != null && parsed.data != null) {
           for (ModelsResponse.ModelEntry m : parsed.data) {
@@ -217,18 +229,28 @@ public class OpenAiCompatibleAdapter implements LlmProviderAdapter {
     return req;
   }
 
-  private LlmProviderException erroHttp(Response resp, int status) {
-    Long retryAfterMs = parseRetryAfter(resp.getHeaderString("Retry-After"));
-    String corpo = "";
-    try {
-      corpo = resp.readEntity(String.class);
-    } catch (Exception ignored) {
-      // corpo indisponível — segue apenas com o status
-    }
+  private LlmProviderException erroHttp(int status, String retryAfterHeader, String corpo) {
+    Long retryAfterMs = parseRetryAfter(retryAfterHeader);
     // Nunca inclui headers de auth; apenas um trecho curto do corpo do erro.
     String trecho = corpo == null ? "" : corpo.substring(0, Math.min(180, corpo.length()));
     LOG.warnf("[OpenAiAdapter] HTTP %d ao chamar provedor: %s", status, trecho);
     return new LlmProviderException(status, retryAfterMs, "HTTP " + status);
+  }
+
+  private String serializar(OpenAiChatRequest body) {
+    try {
+      return MAPPER.writeValueAsString(body);
+    } catch (Exception e) {
+      throw new LlmProviderException(0, null, "falha ao serializar a requisição");
+    }
+  }
+
+  private <T> T parsear(String corpo, Class<T> tipo, int status) {
+    try {
+      return MAPPER.readValue(corpo, tipo);
+    } catch (Exception e) {
+      throw new LlmProviderException(status, null, "resposta ilegível do provedor");
+    }
   }
 
   private Long parseRetryAfter(String header) {

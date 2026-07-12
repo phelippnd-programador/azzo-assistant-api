@@ -181,6 +181,8 @@ public class LlmBookingAgent {
         req.historico = toPoolHistory(history);
         req.mensagemAtual = userMessage;
         req.maxTokens = options.maxTokens();
+        req.tenantId = options.tenantId();
+        req.conversaId = options.conversaId();
 
         LlmResponse resp = poolExecutor.executar(req);
         if (resp == null || resp.erro() || resp.vazia()) {
@@ -232,9 +234,15 @@ public class LlmBookingAgent {
         }
     }
 
-    public record AgentChatOptions(Integer maxTokens, String runtimeInstruction) {
+    public record AgentChatOptions(Integer maxTokens, String runtimeInstruction,
+            String tenantId, String conversaId) {
         public static AgentChatOptions defaultOptions() {
-            return new AgentChatOptions(null, null);
+            return new AgentChatOptions(null, null, null, null);
+        }
+
+        /** Opções padrão que preservam o tenant/conversa para contabilização no pool. */
+        public static AgentChatOptions forContext(String tenantId, String conversaId) {
+            return new AgentChatOptions(null, null, tenantId, conversaId);
         }
     }
 }

@@ -122,13 +122,8 @@ instâncias. O circuit breaker é uma otimização local (por instância).
 
 ## Limitações conhecidas / follow-ups
 
-- **Matriz de testes com WireMock** (429/timeout/5xx contra um servidor fake) ainda
-  não foi adicionada — a lógica pura (scoring, custo, janelas, backoff, capacidade,
-  segurança da view) está coberta por testes unitários.
 - **Observabilidade** (métricas Micrometer por provedor/modelo) é follow-up; hoje há
   o histórico em banco e o resumo/saúde via API.
-- **`tenantId` no histórico** ainda não é propagado pelo `LlmBookingAgent` (fica nulo);
-  requer passar o tenant pela cadeia de chamada.
 - **Adaptadores dedicados** (Google Gemini nativo, Cohere nativo) não implementados;
   a arquitetura já está preparada (basta um bean `LlmProviderAdapter`). Enquanto isso,
   esses provedores funcionam pelos respectivos endpoints compatíveis com OpenAI.

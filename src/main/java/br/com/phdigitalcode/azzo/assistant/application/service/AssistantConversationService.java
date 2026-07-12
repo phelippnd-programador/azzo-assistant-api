@@ -244,7 +244,7 @@ public class AssistantConversationService {
     String enrichedMessage = enrichDatesInMessage(contextualMessage);
     String compactedMessage = compactMessageForLlm(enrichedMessage);
     LlmBookingAgent.AgentChatOptions chatOptions =
-        buildAgentChatOptions(data, rawMessage, tenantId, preparedSlotContext);
+        buildAgentChatOptions(data, rawMessage, tenantId, userIdentifier, preparedSlotContext);
 
     String systemPrompt = agentSystemPromptBuilder.build(tenantId);
     // Passa activeProvider para sticky routing — null = nova conversa, router decide
@@ -2186,6 +2186,7 @@ public class AssistantConversationService {
       ConversationData data,
       String rawMessage,
       String tenantId,
+      String userIdentifier,
       PreparedSlotContext preparedSlotContext) {
     String runtimeInstruction = null;
     Integer maxTokens = null;
@@ -2212,10 +2213,11 @@ public class AssistantConversationService {
     }
 
     if (maxTokens == null && (runtimeInstruction == null || runtimeInstruction.isBlank())) {
-      return LlmBookingAgent.AgentChatOptions.defaultOptions();
+      // Mesmo sem ajustes de geração, preserva tenant/conversa para a contabilização do pool.
+      return LlmBookingAgent.AgentChatOptions.forContext(tenantId, userIdentifier);
     }
 
-    return new LlmBookingAgent.AgentChatOptions(maxTokens, runtimeInstruction);
+    return new LlmBookingAgent.AgentChatOptions(maxTokens, runtimeInstruction, tenantId, userIdentifier);
   }
 
   private String mergeRuntimeInstructions(String currentInstruction, String newInstruction) {
