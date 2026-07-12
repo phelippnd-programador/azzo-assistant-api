@@ -34,6 +34,10 @@ public class LlmCredential extends PanacheEntityBase {
   @Column(name = "api_key_criptografada", nullable = false)
   public String apiKeyCriptografada;
 
+  /** Máscara para exibição (ex.: {@code gsk_••••4F8A}). Calculada na gravação; nunca revela o miolo. */
+  @Column(name = "api_key_mascara", nullable = false, length = 80)
+  public String apiKeyMascara = "";
+
   @Column(name = "organizacao", length = 200)
   public String organizacao;
 

@@ -34,6 +34,7 @@ public class LlmRoutingService {
   @Inject ConsumptionService consumptionService;
   @Inject RoutingMetricsService metricsService;
   @Inject CostCalculator costCalculator;
+  @Inject RoutingStrategyHolder strategyHolder;
 
   @ConfigProperty(name = "assistant.llm.pool.default-strategy", defaultValue = "BALANCEADO")
   String estrategiaPadraoConfig;
@@ -84,11 +85,17 @@ public class LlmRoutingService {
 
   private RoutingStrategy resolverEstrategia(RoutingRequest request) {
     if (request != null && request.estrategia != null) return request.estrategia;
+    if (strategyHolder.override().isPresent()) return strategyHolder.override().get();
     try {
       return RoutingStrategy.valueOf(estrategiaPadraoConfig);
     } catch (IllegalArgumentException e) {
       return RoutingStrategy.PADRAO;
     }
+  }
+
+  /** Estratégia efetiva atual (override em memória ou padrão configurado). */
+  public RoutingStrategy estrategiaAtual() {
+    return resolverEstrategia(null);
   }
 
   private boolean compativel(LlmModel model, RoutingRequest req) {

@@ -30,7 +30,16 @@ public class AdapterCredentialFactory {
 
   public AdapterCredential build(LlmProvider provider, LlmCredential credential) {
     String apiKey = encryption.decrypt(credential.apiKeyCriptografada);
+    return montar(provider, apiKey, credential.organizacao, credential.projeto);
+  }
 
+  /** Constrói a partir de uma chave em claro (ex.: teste de conexão antes de salvar). */
+  public AdapterCredential buildComChave(LlmProvider provider, String apiKeyPlain,
+      String organizacao, String projeto) {
+    return montar(provider, apiKeyPlain, organizacao, projeto);
+  }
+
+  private AdapterCredential montar(LlmProvider provider, String apiKey, String organizacao, String projeto) {
     String endpoint = "/chat/completions";
     String authScheme = "Bearer";
     Map<String, String> headers = new HashMap<>();
@@ -61,8 +70,8 @@ public class AdapterCredentialFactory {
         endpoint,
         apiKey,
         authScheme,
-        credential.organizacao,
-        credential.projeto,
+        organizacao,
+        projeto,
         headers,
         provider.timeoutConexaoMs,
         provider.timeoutRespostaMs);

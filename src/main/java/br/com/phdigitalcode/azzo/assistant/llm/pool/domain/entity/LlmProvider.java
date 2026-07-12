@@ -67,6 +67,9 @@ public class LlmProvider extends PanacheEntityBase {
   @Column(name = "suporta_json_mode", nullable = false)
   public boolean suportaJsonMode = false;
 
+  @Column(name = "ultima_sincronizacao_modelos")
+  public Instant ultimaSincronizacaoModelos;
+
   @Column(name = "data_criacao", nullable = false)
   public Instant dataCriacao;
 
