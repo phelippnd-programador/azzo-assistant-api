@@ -8,8 +8,13 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import br.com.phdigitalcode.azzo.assistant.dialogue.ChatMessage;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmMessage;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmRequest;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmResponse;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.execution.LlmPoolExecutor;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 /**
@@ -36,6 +41,12 @@ public class LlmBookingAgent {
     @Inject
     LlmRouter llmRouter;
 
+    @Inject
+    LlmPoolExecutor poolExecutor;
+
+    @ConfigProperty(name = "assistant.llm.pool.enabled", defaultValue = "false")
+    boolean poolEnabled;
+
     // ─── API pública ──────────────────────────────────────────────────────────
 
     /**
@@ -57,9 +68,20 @@ public class LlmBookingAgent {
 
         long start = System.currentTimeMillis();
         try {
-            LlmRouter.Provider provider = llmRouter.select(activeProvider);
             AgentChatOptions effectiveOptions = options == null ? AgentChatOptions.defaultOptions() : options;
             String effectiveSystemPrompt = applyRuntimeInstruction(systemPrompt, effectiveOptions.runtimeInstruction());
+
+            // Novo pool de provedores (atrás do flag). Se estiver ligado e houver
+            // capacidade, conduz a chamada; caso contrário, cai para o fluxo legado.
+            if (poolEnabled) {
+                AgentResult poolResult = chatViaPool(effectiveSystemPrompt, history, userMessage, effectiveOptions);
+                if (poolResult != null) {
+                    return poolResult;
+                }
+                LOG.debug("[LlmAgent] Pool sem capacidade — usando fluxo legado");
+            }
+
+            LlmRouter.Provider provider = llmRouter.select(activeProvider);
             List<OllamaMessage> messages = buildMessages(effectiveSystemPrompt, history, userMessage);
 
             LlmRouter.LlmResponse response = llmRouter.call(
@@ -144,6 +166,46 @@ public class LlmBookingAgent {
         return systemPrompt + "\n\n" + runtimeInstruction.trim();
     }
 
+    // ─── Integração com o pool de provedores ──────────────────────────────────
+
+    /**
+     * Conduz a chamada pelo novo pool. Retorna {@code null} quando o pool não tem
+     * capacidade/falhou, sinalizando ao chamador para usar o fluxo legado. A estrutura
+     * enviada (system prompt + histórico + mensagem) é a mesma do fluxo atual — o
+     * fallback entre provedores não altera contexto nem regras.
+     */
+    private AgentResult chatViaPool(String systemPrompt, List<ChatMessage> history,
+            String userMessage, AgentChatOptions options) {
+        LlmRequest req = new LlmRequest();
+        req.systemPrompt = systemPrompt;
+        req.historico = toPoolHistory(history);
+        req.mensagemAtual = userMessage;
+        req.maxTokens = options.maxTokens();
+        req.tenantId = options.tenantId();
+        req.conversaId = options.conversaId();
+
+        LlmResponse resp = poolExecutor.executar(req);
+        if (resp == null || resp.erro() || resp.vazia()) {
+            return null;
+        }
+        String raw = resp.texto();
+        List<AgentAction> actions = extractActions(raw);
+        String cleanText = stripActions(raw).trim();
+        if (cleanText.isBlank()) cleanText = "Entendido! 😊";
+        return new AgentResult(cleanText, actions, "POOL");
+    }
+
+    private List<LlmMessage> toPoolHistory(List<ChatMessage> history) {
+        List<LlmMessage> out = new ArrayList<>();
+        if (history != null) {
+            for (ChatMessage msg : history) {
+                String role = "tool".equals(msg.role) ? "user" : msg.role;
+                out.add(new LlmMessage(role, msg.content));
+            }
+        }
+        return out;
+    }
+
     // ─── Tipos públicos ───────────────────────────────────────────────────────
 
     public record AgentResult(String text, List<AgentAction> actions, String providerUsed, boolean llmUnavailable) {
@@ -172,9 +234,15 @@ public class LlmBookingAgent {
         }
     }
 
-    public record AgentChatOptions(Integer maxTokens, String runtimeInstruction) {
+    public record AgentChatOptions(Integer maxTokens, String runtimeInstruction,
+            String tenantId, String conversaId) {
         public static AgentChatOptions defaultOptions() {
-            return new AgentChatOptions(null, null);
+            return new AgentChatOptions(null, null, null, null);
+        }
+
+        /** Opções padrão que preservam o tenant/conversa para contabilização no pool. */
+        public static AgentChatOptions forContext(String tenantId, String conversaId) {
+            return new AgentChatOptions(null, null, tenantId, conversaId);
         }
     }
 }
