@@ -169,6 +169,8 @@ public final class LlmPoolAdminDtos {
     public Boolean suportaJsonMode;
     public Integer limiteRequisicoesMinuto;
     public Integer limiteRequisicoesDia;
+    public Long limiteTokensMinuto;
+    public Long limiteTokensDia;
   }
 
   public static class ModelView {
@@ -190,6 +192,10 @@ public final class LlmPoolAdminDtos {
     public boolean suportaStreaming;
     public boolean suportaToolCalling;
     public boolean suportaJsonMode;
+    public Integer limiteRequisicoesMinuto;
+    public Integer limiteRequisicoesDia;
+    public Long limiteTokensMinuto;
+    public Long limiteTokensDia;
 
     public static ModelView de(LlmModel m) {
       ModelView v = new ModelView();
@@ -211,6 +217,10 @@ public final class LlmPoolAdminDtos {
       v.suportaStreaming = m.suportaStreaming;
       v.suportaToolCalling = m.suportaToolCalling;
       v.suportaJsonMode = m.suportaJsonMode;
+      v.limiteRequisicoesMinuto = m.limiteRequisicoesMinuto;
+      v.limiteRequisicoesDia = m.limiteRequisicoesDia;
+      v.limiteTokensMinuto = m.limiteTokensMinuto;
+      v.limiteTokensDia = m.limiteTokensDia;
       return v;
     }
   }

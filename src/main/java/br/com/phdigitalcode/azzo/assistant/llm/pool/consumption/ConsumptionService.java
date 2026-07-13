@@ -37,10 +37,12 @@ public class ConsumptionService {
     if (excedeuTokens(credential.id, credential.limiteTokensDia, ConsumptionWindow.DIA, agora, tokensEstimados)) return false;
     if (excedeuTokens(credential.id, credential.limiteTokensMes, ConsumptionWindow.MES, agora, tokensEstimados)) return false;
 
-    // Limites de requisições do modelo (aplicados sobre a mesma credencial)
+    // Limites do modelo (RPM/RPD/TPM/TPD) — aplicados sobre a janela da credencial.
     if (model != null) {
       if (excedeuRequisicoes(credential.id, model.limiteRequisicoesMinuto, ConsumptionWindow.MINUTO, agora, 1)) return false;
       if (excedeuRequisicoes(credential.id, model.limiteRequisicoesDia, ConsumptionWindow.DIA, agora, 1)) return false;
+      if (excedeuTokens(credential.id, model.limiteTokensMinuto, ConsumptionWindow.MINUTO, agora, tokensEstimados)) return false;
+      if (excedeuTokens(credential.id, model.limiteTokensDia, ConsumptionWindow.DIA, agora, tokensEstimados)) return false;
     }
     return true;
   }
