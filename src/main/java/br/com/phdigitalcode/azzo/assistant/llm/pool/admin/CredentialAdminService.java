@@ -128,7 +128,7 @@ public class CredentialAdminService {
   private void exigirCriptografia() {
     if (!encryption.isConfigured()) {
       throw new BadRequestException(
-          "Criptografia não configurada (assistant.security.encryption-key) — não é possível gravar credenciais");
+          "Criptografia não configurada (env ENCRYPTION_KEY) — não é possível gravar credenciais");
     }
   }
 

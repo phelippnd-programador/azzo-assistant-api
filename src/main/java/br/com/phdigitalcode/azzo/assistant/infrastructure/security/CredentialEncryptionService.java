@@ -39,7 +39,10 @@ public class CredentialEncryptionService {
   private final SecretKeySpec keySpec;
 
   public CredentialEncryptionService(
-      @ConfigProperty(name = "assistant.security.encryption-key", defaultValue = "") String encryptionKey) {
+      // Mesma chave do agenda-pro: la e app.security.encryption-key=${ENCRYPTION_KEY}.
+      // Aqui a propriedade 'encryption.key' e mapeada pelo Quarkus para a env ENCRYPTION_KEY,
+      // com default vazio para nao exigir a chave no fluxo legado (o agenda exige; aqui nao).
+      @ConfigProperty(name = "encryption.key", defaultValue = "") String encryptionKey) {
     // Chave ausente é tolerada no boot (retrocompatibilidade): a falha só ocorre ao
     // efetivamente cifrar/decifrar sem chave, não ao subir a aplicação no fluxo legado.
     this.keySpec = (encryptionKey == null || encryptionKey.isBlank())
@@ -50,7 +53,7 @@ public class CredentialEncryptionService {
   private SecretKeySpec requireKey() {
     if (keySpec == null) {
       throw new IllegalStateException(
-          "Chave de criptografia nao configurada (assistant.security.encryption-key)");
+          "Chave de criptografia nao configurada (env ENCRYPTION_KEY, a mesma do agenda-pro)");
     }
     return keySpec;
   }

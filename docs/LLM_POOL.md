@@ -14,18 +14,18 @@ provedor interromper o atendimento.
 O pool vem **desligado por padrão** — o fluxo legado (Groq/Ollama via `LlmRouter`)
 continua funcionando sem nenhuma credencial cadastrada.
 
-1. Configure a chave de criptografia das credenciais (AES 16/24/32 bytes, base64 ou texto)
-   pela variável de ambiente do container (o Quarkus mapeia
-   `assistant.security.encryption-key` ⇄ `ASSISTANT_SECURITY_ENCRYPTION_KEY`):
+1. Configure a chave de criptografia das credenciais usando a **mesma env
+   `ENCRYPTION_KEY` do agenda-pro** (lá é `app.security.encryption-key=${ENCRYPTION_KEY}`).
+   No assistant, o `CredentialEncryptionService` lê a propriedade `encryption.key`, que o
+   Quarkus mapeia para a env `ENCRYPTION_KEY`:
 
    ```bash
-   ASSISTANT_SECURITY_ENCRYPTION_KEY=<chave-aes>
+   ENCRYPTION_KEY=<chave-aes-16/24/32-bytes>   # mesma dos dois serviços
    ```
 
-   > Não defina essa propriedade no `application.properties` com default vazio
-   > (`${VAR:}`) — isso quebra o boot no SmallRye. Use a env acima.
+   > Não declare essa propriedade no `application.properties` com default vazio
+   > (`${VAR:}`) — isso quebra o boot no SmallRye. Basta a env acima.
 
-   Use o mesmo padrão seguro do token do WhatsApp (agenda-pro `EncryptionService`).
    Sem essa env, é impossível cadastrar credenciais, mas a aplicação sobe normalmente
    no fluxo legado.
 
