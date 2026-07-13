@@ -120,10 +120,16 @@ instâncias. O circuit breaker é uma otimização local (por instância).
 - Rotas admin protegidas pela chave interna (assistant) + papel `ADMINISTRADOR`
   (gerenciamento) — enforcement no backend, não só no frontend.
 
+## Observabilidade
+
+Métricas Micrometer (expostas em `/q/metrics`, Prometheus):
+`llm.pool.calls{provider,model,status}`, `llm.pool.latency`, `llm.pool.tokens{direction}`,
+`llm.pool.cost`, `llm.pool.fallback`, `llm.pool.rate_limit`, `llm.pool.timeout`,
+`llm.pool.circuit_skip` e o gauge `llm.pool.inflight`. Tags só com identificadores
+seguros — nunca chave, prompt ou resposta.
+
 ## Limitações conhecidas / follow-ups
 
-- **Observabilidade** (métricas Micrometer por provedor/modelo) é follow-up; hoje há
-  o histórico em banco e o resumo/saúde via API.
 - **Adaptadores dedicados** (Google Gemini nativo, Cohere nativo) não implementados;
   a arquitetura já está preparada (basta um bean `LlmProviderAdapter`). Enquanto isso,
   esses provedores funcionam pelos respectivos endpoints compatíveis com OpenAI.
