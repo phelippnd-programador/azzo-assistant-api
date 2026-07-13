@@ -50,12 +50,22 @@ public class LlmPoolExecutor {
   @Inject CostCalculator costCalculator;
   @Inject CredentialCircuitBreaker circuitBreaker;
   @Inject CredentialBlockingService blockingService;
+  @Inject br.com.phdigitalcode.azzo.assistant.llm.pool.observability.PoolMetrics metrics;
 
   @ConfigProperty(name = "assistant.llm.pool.rate-limit-block-ms", defaultValue = "60000")
   long defaultBlockMs;
 
   /** Executa a chamada pelo pool. {@link LlmResponse#erro()} quando nada foi possível. */
   public LlmResponse executar(LlmRequest req) {
+    metrics.inicioChamada();
+    try {
+      return executarInterno(req);
+    } finally {
+      metrics.fimChamada();
+    }
+  }
+
+  private LlmResponse executarInterno(LlmRequest req) {
     RoutingRequest rr = montarRoutingRequest(req);
     List<RoutingSelection> selecoes = routingService.selecionar(rr);
     if (selecoes.isEmpty()) {
@@ -70,6 +80,7 @@ public class LlmPoolExecutor {
       UUID credId = sel.credential().id;
       if (circuitBreaker.isOpen(credId)) {
         LOG.debugf("[PoolExecutor] CB aberto para credential=%s — pulando", credId);
+        metrics.circuitSkip(sel.provider().nome);
         continue;
       }
       req.modelo = sel.model().nomeModelo;
@@ -144,6 +155,9 @@ public class LlmPoolExecutor {
     e.status = UsageStatus.SUCESSO;
     e.dataResposta = Instant.now();
     recordingService.registrar(e);
+
+    metrics.chamada(sel.provider().nome, model.nomeModelo, "SUCESSO", latencia,
+        uso.entrada(), uso.saida(), custo.custo(), fallback);
   }
 
   private void registrarFalha(RoutingSelection sel, LlmRequest req, Integer http, UsageStatus status,
@@ -156,6 +170,11 @@ public class LlmPoolExecutor {
     e.mensagemErroResumida = msg; // já sanitizada (sem chave) na origem
     e.dataResposta = Instant.now();
     recordingService.registrar(e);
+
+    String provider = sel.provider().nome;
+    metrics.chamada(provider, sel.model().nomeModelo, status.name(), latencia, 0, 0, null, fallback);
+    if (status == UsageStatus.RATE_LIMITED) metrics.rateLimit(provider);
+    if (status == UsageStatus.TIMEOUT) metrics.timeout(provider);
   }
 
   private UsageEvent baseEvent(RoutingSelection sel, LlmRequest req, int tentativa, boolean fallback, Instant inicio) {
