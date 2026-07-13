@@ -146,5 +146,7 @@ public class ModelAdminService {
     if (req.suportaJsonMode != null) m.suportaJsonMode = req.suportaJsonMode;
     m.limiteRequisicoesMinuto = req.limiteRequisicoesMinuto;
     m.limiteRequisicoesDia = req.limiteRequisicoesDia;
+    m.limiteTokensMinuto = req.limiteTokensMinuto;
+    m.limiteTokensDia = req.limiteTokensDia;
   }
 }

@@ -79,6 +79,12 @@ public class LlmModel extends PanacheEntityBase {
   @Column(name = "limite_requisicoes_dia")
   public Integer limiteRequisicoesDia;
 
+  @Column(name = "limite_tokens_minuto")
+  public Long limiteTokensMinuto;
+
+  @Column(name = "limite_tokens_dia")
+  public Long limiteTokensDia;
+
   @Column(name = "data_criacao", nullable = false)
   public Instant dataCriacao;
 
