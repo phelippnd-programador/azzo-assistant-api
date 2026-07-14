@@ -50,6 +50,118 @@ public class PoolInsightsService {
     return m;
   }
 
+  /**
+   * Métricas agregadas por PROVEDOR no período (chamadas, tokens, custo, latência
+   * média, taxa de sucesso, fallbacks) — a partir do histórico de uso.
+   */
+  @SuppressWarnings("unchecked")
+  public List<Map<String, Object>> porProvedor(Instant desde) {
+    List<Object[]> rows = em.createNativeQuery(
+            "SELECT h.provider_id, p.nome, COUNT(*), COALESCE(SUM(h.tokens_entrada),0), "
+                + "COALESCE(SUM(h.tokens_saida),0), COALESCE(SUM(h.custo_estimado),0), "
+                + "COALESCE(AVG(h.latencia_ms),0), COUNT(*) FILTER (WHERE h.status='SUCESSO'), "
+                + "COUNT(*) FILTER (WHERE h.fallback_utilizado) "
+                + "FROM llm_usage_history h LEFT JOIN llm_provider p ON p.id = h.provider_id "
+                + "WHERE h.data_requisicao >= :desde "
+                + "GROUP BY h.provider_id, p.nome ORDER BY COUNT(*) DESC")
+        .setParameter("desde", desde)
+        .getResultList();
+
+    List<Map<String, Object>> out = new java.util.ArrayList<>();
+    for (Object[] r : rows) {
+      long chamadas = num(r[2]);
+      long sucesso = num(r[7]);
+      Map<String, Object> m = new LinkedHashMap<>();
+      m.put("providerId", r[0] != null ? r[0].toString() : null);
+      m.put("nome", r[1] != null ? r[1] : "Desconhecido");
+      m.put("chamadas", chamadas);
+      m.put("tokensEntrada", num(r[3]));
+      m.put("tokensSaida", num(r[4]));
+      m.put("custoEstimado", r[5]);
+      m.put("latenciaMediaMs", Math.round(((Number) r[6]).doubleValue()));
+      m.put("taxaSucesso", chamadas > 0 ? Math.round((sucesso * 1000.0) / chamadas) / 10.0 : 0.0);
+      m.put("fallbacks", num(r[8]));
+      out.add(m);
+    }
+    return out;
+  }
+
+  /**
+   * Métricas agregadas por CREDENCIAL (chave) no período, opcionalmente filtradas
+   * por provedor.
+   */
+  @SuppressWarnings("unchecked")
+  public List<Map<String, Object>> porCredencial(UUID providerId, Instant desde) {
+    StringBuilder sql = new StringBuilder(
+        "SELECT h.credential_id, c.nome_identificacao, COUNT(*), COALESCE(SUM(h.tokens_entrada),0), "
+            + "COALESCE(SUM(h.tokens_saida),0), COALESCE(SUM(h.custo_estimado),0), "
+            + "COALESCE(AVG(h.latencia_ms),0), COUNT(*) FILTER (WHERE h.status='SUCESSO') "
+            + "FROM llm_usage_history h LEFT JOIN llm_credential c ON c.id = h.credential_id "
+            + "WHERE h.data_requisicao >= :desde ");
+    if (providerId != null) sql.append("AND h.provider_id = :pid ");
+    sql.append("GROUP BY h.credential_id, c.nome_identificacao ORDER BY COUNT(*) DESC");
+
+    jakarta.persistence.Query q = em.createNativeQuery(sql.toString()).setParameter("desde", desde);
+    if (providerId != null) q.setParameter("pid", providerId);
+    List<Object[]> rows = q.getResultList();
+
+    List<Map<String, Object>> out = new java.util.ArrayList<>();
+    for (Object[] r : rows) {
+      long chamadas = num(r[2]);
+      long sucesso = num(r[7]);
+      Map<String, Object> m = new LinkedHashMap<>();
+      m.put("credentialId", r[0] != null ? r[0].toString() : null);
+      m.put("nomeIdentificacao", r[1] != null ? r[1] : "Desconhecida");
+      m.put("chamadas", chamadas);
+      m.put("tokensEntrada", num(r[3]));
+      m.put("tokensSaida", num(r[4]));
+      m.put("custoEstimado", r[5]);
+      m.put("latenciaMediaMs", Math.round(((Number) r[6]).doubleValue()));
+      m.put("taxaSucesso", chamadas > 0 ? Math.round((sucesso * 1000.0) / chamadas) / 10.0 : 0.0);
+      out.add(m);
+    }
+    return out;
+  }
+
+  /**
+   * Métricas agregadas por MODELO no período, opcionalmente filtradas por provedor.
+   */
+  @SuppressWarnings("unchecked")
+  public List<Map<String, Object>> porModelo(UUID providerId, Instant desde) {
+    StringBuilder sql = new StringBuilder(
+        "SELECT h.model_id, m.nome_modelo, m.nome_exibicao, m.gratuito, COUNT(*), "
+            + "COALESCE(SUM(h.tokens_entrada),0), COALESCE(SUM(h.tokens_saida),0), "
+            + "COALESCE(SUM(h.custo_estimado),0), COALESCE(AVG(h.latencia_ms),0), "
+            + "COUNT(*) FILTER (WHERE h.status='SUCESSO') "
+            + "FROM llm_usage_history h LEFT JOIN llm_model m ON m.id = h.model_id "
+            + "WHERE h.data_requisicao >= :desde ");
+    if (providerId != null) sql.append("AND h.provider_id = :pid ");
+    sql.append("GROUP BY h.model_id, m.nome_modelo, m.nome_exibicao, m.gratuito ORDER BY COUNT(*) DESC");
+
+    jakarta.persistence.Query q = em.createNativeQuery(sql.toString()).setParameter("desde", desde);
+    if (providerId != null) q.setParameter("pid", providerId);
+    List<Object[]> rows = q.getResultList();
+
+    List<Map<String, Object>> out = new java.util.ArrayList<>();
+    for (Object[] r : rows) {
+      long chamadas = num(r[4]);
+      long sucesso = num(r[9]);
+      Map<String, Object> m = new LinkedHashMap<>();
+      m.put("modelId", r[0] != null ? r[0].toString() : null);
+      m.put("nomeModelo", r[1] != null ? r[1] : "Desconhecido");
+      m.put("nomeExibicao", r[2]);
+      m.put("gratuito", r[3] != null && (Boolean) r[3]);
+      m.put("chamadas", chamadas);
+      m.put("tokensEntrada", num(r[5]));
+      m.put("tokensSaida", num(r[6]));
+      m.put("custoEstimado", r[7]);
+      m.put("latenciaMediaMs", Math.round(((Number) r[8]).doubleValue()));
+      m.put("taxaSucesso", chamadas > 0 ? Math.round((sucesso * 1000.0) / chamadas) / 10.0 : 0.0);
+      out.add(m);
+    }
+    return out;
+  }
+
   /** Histórico paginado com filtros opcionais. */
   public List<Map<String, Object>> historico(UUID providerId, String status, Instant desde, int page, int size) {
     StringBuilder jpql = new StringBuilder("1=1");
