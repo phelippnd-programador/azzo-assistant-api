@@ -169,6 +169,26 @@ public class LlmPoolAdminResource {
     return insightsService.saude();
   }
 
+  /** Métricas agregadas por provedor (chamadas, tokens, custo, latência, sucesso). */
+  @GET @Path("/metrics/providers")
+  public List<Map<String, Object>> metricasPorProvedor(@QueryParam("horas") @DefaultValue("24") int horas) {
+    return insightsService.porProvedor(desde(horas));
+  }
+
+  /** Métricas agregadas por credencial (chave), opcionalmente filtradas por provedor. */
+  @GET @Path("/metrics/credentials")
+  public List<Map<String, Object>> metricasPorCredencial(
+      @QueryParam("providerId") UUID providerId, @QueryParam("horas") @DefaultValue("24") int horas) {
+    return insightsService.porCredencial(providerId, desde(horas));
+  }
+
+  /** Métricas agregadas por modelo, opcionalmente filtradas por provedor. */
+  @GET @Path("/metrics/models")
+  public List<Map<String, Object>> metricasPorModelo(
+      @QueryParam("providerId") UUID providerId, @QueryParam("horas") @DefaultValue("24") int horas) {
+    return insightsService.porModelo(providerId, desde(horas));
+  }
+
   @GET @Path("/historico")
   public List<Map<String, Object>> historico(
       @QueryParam("providerId") UUID providerId,
