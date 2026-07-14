@@ -61,4 +61,13 @@ class CredentialEncryptionServiceTest {
     // Mas usar a criptografia sem chave lanca.
     assertThrows(IllegalStateException.class, () -> semChave.encrypt("x"));
   }
+
+  @Test
+  void chaveInvalidaNaoQuebraOBoot() {
+    // Chave presente porém com tamanho invalido (nao 16/24/32 bytes): o construtor
+    // NAO pode lancar (nao pode derrubar o boot) — apenas desabilita a criptografia.
+    CredentialEncryptionService chaveRuim = new CredentialEncryptionService("chave-curta");
+    assertFalse(chaveRuim.isConfigured());
+    assertThrows(IllegalStateException.class, () -> chaveRuim.encrypt("x"));
+  }
 }

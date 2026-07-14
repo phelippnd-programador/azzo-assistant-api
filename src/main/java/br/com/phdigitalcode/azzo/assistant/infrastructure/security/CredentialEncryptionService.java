@@ -10,6 +10,7 @@ import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
 import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.jboss.logging.Logger;
 
 import jakarta.enterprise.context.ApplicationScoped;
 
@@ -32,6 +33,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 @ApplicationScoped
 public class CredentialEncryptionService {
 
+  private static final Logger LOG = Logger.getLogger(CredentialEncryptionService.class);
   private static final int IV_LENGTH = 12;
   private static final int TAG_LENGTH = 128;
 
@@ -43,11 +45,19 @@ public class CredentialEncryptionService {
       // Aqui a propriedade 'encryption.key' e mapeada pelo Quarkus para a env ENCRYPTION_KEY,
       // com default vazio para nao exigir a chave no fluxo legado (o agenda exige; aqui nao).
       @ConfigProperty(name = "encryption.key", defaultValue = "") String encryptionKey) {
-    // Chave ausente é tolerada no boot (retrocompatibilidade): a falha só ocorre ao
-    // efetivamente cifrar/decifrar sem chave, não ao subir a aplicação no fluxo legado.
-    this.keySpec = (encryptionKey == null || encryptionKey.isBlank())
-        ? null
-        : new SecretKeySpec(parseKey(encryptionKey), "AES");
+    // Robustez de boot: chave AUSENTE ou INVALIDA nunca derruba a aplicacao — apenas
+    // desabilita a criptografia (o pool cai no fluxo legado). Uma chave malconfigurada
+    // nao pode tirar o atendimento do WhatsApp do ar. Nunca loga o valor da chave.
+    SecretKeySpec parsed = null;
+    if (encryptionKey != null && !encryptionKey.isBlank()) {
+      try {
+        parsed = new SecretKeySpec(parseKey(encryptionKey), "AES");
+      } catch (RuntimeException e) {
+        LOG.warnf("[CredentialEncryption] ENCRYPTION_KEY invalida (%s) — criptografia desabilitada; "
+            + "o pool de provedores ficara indisponivel ate corrigir a chave.", e.getMessage());
+      }
+    }
+    this.keySpec = parsed;
   }
 
   private SecretKeySpec requireKey() {
@@ -126,7 +136,7 @@ public class CredentialEncryptionService {
 
   private byte[] parseKey(String configuredKey) {
     if (configuredKey == null || configuredKey.isBlank()) {
-      throw new IllegalStateException("Chave de criptografia nao configurada (assistant.security.encryption-key)");
+      throw new IllegalStateException("Chave de criptografia nao configurada (env ENCRYPTION_KEY)");
     }
     byte[] decoded = tryDecodeBase64(configuredKey);
     if (isValidAesKey(decoded)) return decoded;
