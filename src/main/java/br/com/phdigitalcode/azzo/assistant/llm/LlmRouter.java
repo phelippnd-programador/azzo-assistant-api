@@ -399,9 +399,14 @@ public class LlmRouter {
     static String describeFailure(Exception e) {
         if (e instanceof jakarta.ws.rs.WebApplicationException wae) {
             int status = wae.getResponse() != null ? wae.getResponse().getStatus() : -1;
-            if (status >= 500) return "HTTP " + status + " (erro no servidor LLM)";
-            if (status >= 400) return "HTTP " + status + " (requisição rejeitada)";
-            return "HTTP " + status;
+            // Surface o corpo do erro do provedor (ex.: Groq "model_decommissioned",
+            // "invalid_api_key", limite de tokens) para diagnostico — antes so mostrava
+            // o status e o motivo real ficava invisivel. Nunca inclui a API key.
+            String corpo = lerCorpoErro(wae);
+            String extra = corpo.isBlank() ? "" : " | " + corpo;
+            if (status >= 500) return "HTTP " + status + " (erro no servidor LLM)" + extra;
+            if (status >= 400) return "HTTP " + status + " (requisição rejeitada)" + extra;
+            return "HTTP " + status + extra;
         }
 
         Throwable cause = e;
@@ -422,6 +427,21 @@ public class LlmRouter {
         // Mensagens estruturais ja legiveis lancadas por callOllama/callGroq
         // (resposta nula, choices vazio, message nula, conteudo vazio, resposta vazia).
         return e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+    }
+
+    /** Lê um trecho curto do corpo do erro HTTP do provedor, sem nunca expor a API key. */
+    private static String lerCorpoErro(jakarta.ws.rs.WebApplicationException wae) {
+        try {
+            var response = wae.getResponse();
+            if (response == null || !response.hasEntity()) return "";
+            response.bufferEntity();
+            String corpo = response.readEntity(String.class);
+            if (corpo == null) return "";
+            corpo = corpo.replaceAll("\\s+", " ").trim();
+            return corpo.substring(0, Math.min(300, corpo.length()));
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 
     private int resolveMaxTokens(Integer requestedMaxTokens) {

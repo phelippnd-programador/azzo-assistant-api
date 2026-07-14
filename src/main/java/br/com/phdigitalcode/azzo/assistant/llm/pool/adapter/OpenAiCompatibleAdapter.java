@@ -231,10 +231,13 @@ public class OpenAiCompatibleAdapter implements LlmProviderAdapter {
 
   private LlmProviderException erroHttp(int status, String retryAfterHeader, String corpo) {
     Long retryAfterMs = parseRetryAfter(retryAfterHeader);
-    // Nunca inclui headers de auth; apenas um trecho curto do corpo do erro.
-    String trecho = corpo == null ? "" : corpo.substring(0, Math.min(180, corpo.length()));
+    // Nunca inclui headers de auth; apenas um trecho curto do corpo do erro (ex.: Groq
+    // "model_decommissioned", "invalid_api_key", "rate_limit_exceeded").
+    String trecho = corpo == null ? "" : corpo.replaceAll("\\s+", " ").trim();
+    if (trecho.length() > 180) trecho = trecho.substring(0, 180);
     LOG.warnf("[OpenAiAdapter] HTTP %d ao chamar provedor: %s", status, trecho);
-    return new LlmProviderException(status, retryAfterMs, "HTTP " + status);
+    String msg = trecho.isBlank() ? "HTTP " + status : "HTTP " + status + ": " + trecho;
+    return new LlmProviderException(status, retryAfterMs, msg);
   }
 
   private String serializar(OpenAiChatRequest body) {
