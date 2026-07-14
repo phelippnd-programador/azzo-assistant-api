@@ -73,6 +73,9 @@ public class LlmPoolExecutor {
       return LlmResponse.falha();
     }
 
+    LOG.infof("[PoolExecutor] %d opcao(oes) elegivel(is); primaria: provider=%s model=%s",
+        selecoes.size(), selecoes.get(0).provider().nome, selecoes.get(0).model().nomeModelo);
+
     boolean fallback = false;
     int tentativaGlobal = 0;
 
@@ -101,6 +104,8 @@ public class LlmPoolExecutor {
           return resp;
         } catch (LlmProviderException e) {
           long latencia = System.currentTimeMillis() - t0;
+          LOG.warnf("[PoolExecutor] provider=%s model=%s credential=%s tentativa=%d falhou: %s",
+              sel.provider().nome, sel.model().nomeModelo, sel.credential().nomeIdentificacao, tentativa, e.getMessage());
           registrarFalha(sel, req, e.getHttpStatus(), statusDe(e), tipoErro(e), e.getMessage(),
               latencia, tentativaGlobal, fallback, inicio);
 
@@ -121,6 +126,8 @@ public class LlmPoolExecutor {
           circuitBreaker.onFailure(credId);
         } catch (Exception e) {
           long latencia = System.currentTimeMillis() - t0;
+          LOG.warnf("[PoolExecutor] provider=%s model=%s credential=%s tentativa=%d erro de conexao/timeout: %s",
+              sel.provider().nome, sel.model().nomeModelo, sel.credential().nomeIdentificacao, tentativa, e.getMessage());
           registrarFalha(sel, req, null, UsageStatus.TIMEOUT, "CONEXAO", e.getMessage(),
               latencia, tentativaGlobal, fallback, inicio);
           if (tentativa < maxTentativas) {

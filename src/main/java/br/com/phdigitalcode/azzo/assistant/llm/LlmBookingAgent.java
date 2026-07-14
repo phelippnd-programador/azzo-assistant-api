@@ -12,7 +12,9 @@ import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmMessage;
 import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmRequest;
 import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmResponse;
 import br.com.phdigitalcode.azzo.assistant.llm.pool.execution.LlmPoolExecutor;
+import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
@@ -47,6 +49,11 @@ public class LlmBookingAgent {
     @ConfigProperty(name = "assistant.llm.pool.enabled", defaultValue = "false")
     boolean poolEnabled;
 
+    void onStart(@Observes StartupEvent ev) {
+        LOG.infof("[LlmAgent] Pool de provedores de LLM: %s (assistant.llm.pool.enabled=%s)",
+                poolEnabled ? "HABILITADO" : "DESABILITADO — usando fluxo legado (Groq/Ollama)", poolEnabled);
+    }
+
     // ─── API pública ──────────────────────────────────────────────────────────
 
     /**
@@ -78,7 +85,10 @@ public class LlmBookingAgent {
                 if (poolResult != null) {
                     return poolResult;
                 }
-                LOG.debug("[LlmAgent] Pool sem capacidade — usando fluxo legado");
+                LOG.info("[LlmAgent] Pool habilitado, mas sem resposta (sem opção elegível ou todas falharam) "
+                        + "— usando fluxo legado (Groq/Ollama)");
+            } else {
+                LOG.debug("[LlmAgent] Pool desabilitado (assistant.llm.pool.enabled=false) — fluxo legado");
             }
 
             LlmRouter.Provider provider = llmRouter.select(activeProvider);
@@ -189,6 +199,7 @@ public class LlmBookingAgent {
             return null;
         }
         String raw = resp.texto();
+        LOG.infof("[LlmAgent] Pool respondeu (provider=POOL, %d chars)", raw.length());
         List<AgentAction> actions = extractActions(raw);
         String cleanText = stripActions(raw).trim();
         if (cleanText.isBlank()) cleanText = "Entendido! 😊";
