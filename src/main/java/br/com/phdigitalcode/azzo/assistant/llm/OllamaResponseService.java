@@ -11,12 +11,14 @@ import org.jboss.logging.Logger;
 
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ProfissionalDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ServicoDto;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmRequest;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmResponse;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.execution.LlmPoolExecutor;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 /**
- * Gera respostas humanizadas via LLM (Ollama, com fallback pro Groq pelo
- * LlmRouter).
+ * Gera respostas humanizadas via LLM (pool de provedores).
  *
  * REGRA DE SEGURANÇA: o LLM NUNCA gera dados vindos da API (preços, nomes,
  * especialidades, horários). Ele gera apenas o intro/saudação conversacional.
@@ -45,12 +47,10 @@ public class OllamaResponseService {
     private static final int CACHE_MAX_ENTRIES = 200;
 
     @Inject
-    LlmRouter llmRouter;
+    LlmPoolExecutor poolExecutor;
 
-    @ConfigProperty(name = "assistant.ollama.enabled", defaultValue = "false")
-    boolean enabled;
-
-    @ConfigProperty(name = "assistant.ollama.response.enabled", defaultValue = "true")
+    /** Liga/desliga a geração de intros humanizadas via LLM (usa apenas strings hardcoded quando false). */
+    @ConfigProperty(name = "assistant.llm.response.enabled", defaultValue = "true")
     boolean responseEnabled;
 
     private record CacheEntry(String value, long expiresAt) {
@@ -95,7 +95,7 @@ public class OllamaResponseService {
                 + "NÃO mencione preços, nomes de serviços ou números. Apenas a saudação.";
 
         String cacheKey = "services_intro:" + (firstName != null ? firstName : "_");
-        Optional<String> intro = callOllamaCached(cacheKey, introPrompt, INTRO_SYSTEM_PROMPT, 40);
+        Optional<String> intro = callPoolCached(cacheKey, introPrompt, INTRO_SYSTEM_PROMPT, 40);
         if (intro.isEmpty()) return Optional.empty();
 
         String introText = safeIntro(intro.get(), firstName != null
@@ -137,7 +137,7 @@ public class OllamaResponseService {
                 + "NÃO mencione nomes, especialidades ou números. Apenas a saudação.";
 
         String cacheKey = "professionals_intro:" + (firstName != null ? firstName : "_") + ":" + serviceName;
-        Optional<String> intro = callOllamaCached(cacheKey, introPrompt, INTRO_SYSTEM_PROMPT, 40);
+        Optional<String> intro = callPoolCached(cacheKey, introPrompt, INTRO_SYSTEM_PROMPT, 40);
         if (intro.isEmpty()) return Optional.empty();
 
         String introText = safeIntro(intro.get(), firstName != null
@@ -168,7 +168,7 @@ public class OllamaResponseService {
                 + "e peça para o cliente escolher pelo número ou digitando o horário. "
                 + "Use EXATAMENTE os horários listados acima, não invente outros.";
 
-        return callOllama(userPrompt, null, 200);
+        return callPool(userPrompt, null, 200);
     }
 
     /**
@@ -182,49 +182,49 @@ public class OllamaResponseService {
                 + "Instrua o cliente a responder SIM para ser atendido por uma pessoa.";
 
         // Conteúdo 100% estático (sem dados variáveis) — chave de cache fixa.
-        return callOllamaCached("handoff", userPrompt, null, 80);
+        return callPoolCached("handoff", userPrompt, null, 80);
     }
 
     // ─── Infra ────────────────────────────────────────────────────────────────
 
-    /** Como {@link #callOllama}, mas memoiza o resultado por CACHE_TTL_MS sob a chave dada. */
-    private Optional<String> callOllamaCached(String cacheKey, String userPrompt, String systemOverride, int maxTokens) {
+    /** Como {@link #callPool}, mas memoiza o resultado por CACHE_TTL_MS sob a chave dada. */
+    private Optional<String> callPoolCached(String cacheKey, String userPrompt, String systemOverride, int maxTokens) {
         CacheEntry cached = introCache.get(cacheKey);
         if (cached != null && !cached.isExpired()) {
-            LOG.debugf("[OllamaResponse] Cache hit: %s", cacheKey);
+            LOG.debugf("[LlmResponse] Cache hit: %s", cacheKey);
             return Optional.of(cached.value());
         }
 
-        Optional<String> generated = callOllama(userPrompt, systemOverride, maxTokens);
+        Optional<String> generated = callPool(userPrompt, systemOverride, maxTokens);
         generated.ifPresent(value ->
             introCache.put(cacheKey, new CacheEntry(value, System.currentTimeMillis() + CACHE_TTL_MS)));
         return generated;
     }
 
-    private Optional<String> callOllama(String userPrompt, String systemOverride, int maxTokens) {
+    private Optional<String> callPool(String userPrompt, String systemOverride, int maxTokens) {
         long start = System.currentTimeMillis();
         try {
-            String systemPrompt = systemOverride != null ? systemOverride : BASE_SYSTEM_PROMPT;
-            List<OllamaMessage> messages = List.of(
-                    new OllamaMessage("system", systemPrompt),
-                    new OllamaMessage("user", userPrompt));
+            LlmRequest req = new LlmRequest();
+            req.systemPrompt = systemOverride != null ? systemOverride : BASE_SYSTEM_PROMPT;
+            req.mensagemAtual = userPrompt;
+            req.temperatura = 0.5;
+            req.maxTokens = maxTokens;
 
-            LlmRouter.LlmResponse response = llmRouter.callStructured(
-                LlmRouter.Provider.OLLAMA, messages, 0.5, maxTokens, false);
+            LlmResponse response = poolExecutor.executar(req);
             long elapsed = System.currentTimeMillis() - start;
 
-            if (response.isError()) {
-                LOG.warnf("[OllamaResponse] Resposta vazia após %dms", elapsed);
+            if (response == null || response.erro() || response.vazia()) {
+                LOG.warnf("[LlmResponse] Pool sem resposta após %dms", elapsed);
                 return Optional.empty();
             }
 
-            String content = cleanResponse(response.text());
-            LOG.infof("[OllamaResponse] Gerado em %dms (%d chars) provider=%s", elapsed, content.length(), response.provider());
+            String content = cleanResponse(response.texto());
+            LOG.infof("[LlmResponse] Gerado em %dms (%d chars)", elapsed, content.length());
             return Optional.of(content);
 
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - start;
-            LOG.warnf("[OllamaResponse] Falhou após %dms → usando fallback hardcoded. Causa: %s",
+            LOG.warnf("[LlmResponse] Falhou após %dms → usando fallback hardcoded. Causa: %s",
                     elapsed, e.getMessage());
             return Optional.empty();
         }
@@ -264,7 +264,7 @@ public class OllamaResponseService {
     }
 
     private boolean isActive() {
-        return enabled && responseEnabled;
+        return responseEnabled;
     }
 
     private String firstName(String fullName) {

@@ -16,16 +16,14 @@ import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
-import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 /**
- * Agente LLM principal: envia o histórico completo da conversa ao LLM
- * (via LlmRouter) e retorna a resposta limpa + lista de ações detectadas.
- *
- * O LlmRouter decide automaticamente se usa Groq ou Ollama:
- * - Sticky por conversa: mantém o mesmo provider durante todo o diálogo
- * - Fallback automático: se Groq falhar, tenta Ollama
+ * Agente LLM principal: envia o histórico completo da conversa ao pool de
+ * provedores de LLM ({@link LlmPoolExecutor}) e retorna a resposta limpa +
+ * lista de ações detectadas. Não existe caminho alternativo — toda chamada de
+ * LLM para o chat do assistente passa pelo pool (provedores/chaves/modelos
+ * cadastrados no banco, com roteamento, fallback e limites geridos por ele).
  *
  * Action tokens emitidos pelo LLM (no final da mensagem):
  *   [CONSULTAR_HORARIOS:prof=P1|date=YYYY-MM-DD|svc=S1]
@@ -41,28 +39,22 @@ public class LlmBookingAgent {
             Pattern.compile("\\[([A-Z_]+):([^\\]]+)\\]", Pattern.CASE_INSENSITIVE);
 
     @Inject
-    LlmRouter llmRouter;
-
-    @Inject
     LlmPoolExecutor poolExecutor;
 
-    @ConfigProperty(name = "assistant.llm.pool.enabled", defaultValue = "false")
-    boolean poolEnabled;
-
     void onStart(@Observes StartupEvent ev) {
-        LOG.infof("[LlmAgent] Pool de provedores de LLM: %s (assistant.llm.pool.enabled=%s)",
-                poolEnabled ? "HABILITADO" : "DESABILITADO — usando fluxo legado (Groq/Ollama)", poolEnabled);
+        LOG.info("[LlmAgent] Chat do assistente atende exclusivamente pelo pool de provedores de LLM.");
     }
 
     // ─── API pública ──────────────────────────────────────────────────────────
 
     /**
-     * Envia mensagem ao LLM com o histórico completo.
+     * Envia mensagem ao LLM (pool de provedores) com o histórico completo.
      *
      * @param systemPrompt   prompt do sistema com catálogo do salão
      * @param history        histórico de mensagens anteriores
      * @param userMessage    nova mensagem do usuário
-     * @param activeProvider provider já em uso na conversa (sticky), ou null se nova
+     * @param activeProvider mantido por compatibilidade de assinatura; não influencia
+     *                       a seleção — o pool decide provedor/credencial/modelo a cada chamada
      * @return resultado com texto limpo, ações detectadas e provider usado
      */
     public AgentResult chat(String systemPrompt, List<ChatMessage> history,
@@ -78,50 +70,20 @@ public class LlmBookingAgent {
             AgentChatOptions effectiveOptions = options == null ? AgentChatOptions.defaultOptions() : options;
             String effectiveSystemPrompt = applyRuntimeInstruction(systemPrompt, effectiveOptions.runtimeInstruction());
 
-            // Novo pool de provedores (atrás do flag). Se estiver ligado e houver
-            // capacidade, conduz a chamada; caso contrário, cai para o fluxo legado.
-            if (poolEnabled) {
-                AgentResult poolResult = chatViaPool(effectiveSystemPrompt, history, userMessage, effectiveOptions);
-                if (poolResult != null) {
-                    return poolResult;
-                }
-                LOG.info("[LlmAgent] Pool habilitado, mas sem resposta (sem opção elegível ou todas falharam) "
-                        + "— usando fluxo legado (Groq/Ollama)");
-            } else {
-                LOG.debug("[LlmAgent] Pool desabilitado (assistant.llm.pool.enabled=false) — fluxo legado");
+            AgentResult poolResult = chatViaPool(effectiveSystemPrompt, history, userMessage, effectiveOptions);
+            if (poolResult != null) {
+                return poolResult;
             }
 
-            LlmRouter.Provider provider = llmRouter.select(activeProvider);
-            List<OllamaMessage> messages = buildMessages(effectiveSystemPrompt, history, userMessage);
-
-            LlmRouter.LlmResponse response = llmRouter.call(
-                    provider,
-                    effectiveSystemPrompt,
-                    messages,
-                    effectiveOptions.maxTokens());
             long elapsed = System.currentTimeMillis() - start;
-
-            if (response.isError()) {
-                LOG.warnf("[LlmAgent] Resposta vazia após %dms (provider=%s)", elapsed, provider);
-                return AgentResult.fallback("Desculpe, tive um probleminha. Pode repetir? 😅", provider.name());
-            }
-
-            String raw = response.text();
-            LOG.infof("[LlmAgent] %s respondeu em %dms (%d chars)", provider, elapsed, raw.length());
-
-            List<AgentAction> actions = extractActions(raw);
-            String cleanText = stripActions(raw).trim();
-            if (cleanText.isBlank()) cleanText = "Entendido! 😊";
-
-            return new AgentResult(
-                    cleanText,
-                    actions,
-                    response.provider() != null ? response.provider().name() : provider.name());
+            LOG.warnf("[LlmAgent] Pool sem resposta após %dms (nenhuma opção elegível ou todas as tentativas falharam)",
+                    elapsed);
+            return AgentResult.fallback("Desculpe, tive um probleminha. Pode repetir? 😅", "POOL");
 
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - start;
             LOG.warnf("[LlmAgent] Falhou após %dms: %s", elapsed, e.getMessage());
-            return AgentResult.fallback("Desculpe, tive um probleminha. Pode repetir? 😅", activeProvider);
+            return AgentResult.fallback("Desculpe, tive um probleminha. Pode repetir? 😅", "POOL");
         }
     }
 
@@ -153,22 +115,6 @@ public class LlmBookingAgent {
                 .replaceAll("\n{3,}", "\n\n");
     }
 
-    // ─── Montagem de mensagens ────────────────────────────────────────────────
-
-    private List<OllamaMessage> buildMessages(String systemPrompt, List<ChatMessage> history,
-            String userMessage) {
-        List<OllamaMessage> messages = new ArrayList<>();
-        messages.add(new OllamaMessage("system", systemPrompt));
-        for (ChatMessage msg : history) {
-            String role = "tool".equals(msg.role) ? "user" : msg.role;
-            messages.add(new OllamaMessage(role, msg.content));
-        }
-        if (!userMessage.isBlank()) {
-            messages.add(new OllamaMessage("user", userMessage));
-        }
-        return messages;
-    }
-
     private String applyRuntimeInstruction(String systemPrompt, String runtimeInstruction) {
         if (runtimeInstruction == null || runtimeInstruction.isBlank()) {
             return systemPrompt;
@@ -179,10 +125,9 @@ public class LlmBookingAgent {
     // ─── Integração com o pool de provedores ──────────────────────────────────
 
     /**
-     * Conduz a chamada pelo novo pool. Retorna {@code null} quando o pool não tem
-     * capacidade/falhou, sinalizando ao chamador para usar o fluxo legado. A estrutura
-     * enviada (system prompt + histórico + mensagem) é a mesma do fluxo atual — o
-     * fallback entre provedores não altera contexto nem regras.
+     * Conduz a chamada pelo pool. Retorna {@code null} quando não há opção elegível
+     * (nenhum provedor/credencial/modelo ativo e dentro do limite) ou todas as
+     * tentativas falharam — o chamador trata isso como indisponibilidade do LLM.
      */
     private AgentResult chatViaPool(String systemPrompt, List<ChatMessage> history,
             String userMessage, AgentChatOptions options) {
@@ -199,7 +144,7 @@ public class LlmBookingAgent {
             return null;
         }
         String raw = resp.texto();
-        LOG.infof("[LlmAgent] Pool respondeu (provider=POOL, %d chars)", raw.length());
+        LOG.infof("[LlmAgent] Pool respondeu (%d chars)", raw.length());
         List<AgentAction> actions = extractActions(raw);
         String cleanText = stripActions(raw).trim();
         if (cleanText.isBlank()) cleanText = "Entendido! 😊";

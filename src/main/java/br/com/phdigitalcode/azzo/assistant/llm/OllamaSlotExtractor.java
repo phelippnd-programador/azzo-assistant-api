@@ -3,20 +3,22 @@ package br.com.phdigitalcode.azzo.assistant.llm;
 import java.util.List;
 import java.util.Optional;
 
-import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmRequest;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmResponse;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.execution.LlmPoolExecutor;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 /**
- * Extrai slots de linguagem natural via LLM (Ollama, com fallback pro Groq
- * pelo LlmRouter) como fallback. Chamado SOMENTE quando os extratores
- * determinísticos (OpenNLP, regex) falham. Sempre retorna Optional.empty()
- * em caso de falha — nunca lança exceção.
+ * Extrai slots de linguagem natural via LLM (pool de provedores) como
+ * fallback. Chamado SOMENTE quando os extratores determinísticos (OpenNLP,
+ * regex) falham. Sempre retorna Optional.empty() em caso de falha — nunca
+ * lança exceção.
  */
 @ApplicationScoped
 public class OllamaSlotExtractor {
@@ -24,20 +26,17 @@ public class OllamaSlotExtractor {
     private static final Logger LOG = Logger.getLogger(OllamaSlotExtractor.class);
 
     @Inject
-    LlmRouter llmRouter;
+    LlmPoolExecutor poolExecutor;
 
     @Inject
     ObjectMapper objectMapper;
-
-    @ConfigProperty(name = "assistant.ollama.enabled", defaultValue = "false")
-    boolean enabled;
 
     /**
      * Identifica qual serviço o usuário mencionou comparando com a lista disponível.
      * Ex: "quero fazer as unhas" + ["Manicure", "Pedicure"] → Optional.of("Manicure")
      */
     public Optional<String> extractServiceName(String message, List<String> availableServices) {
-        if (!enabled || message == null || message.isBlank()
+        if (message == null || message.isBlank()
                 || availableServices == null || availableServices.isEmpty()) {
             return Optional.empty();
         }
@@ -59,17 +58,19 @@ public class OllamaSlotExtractor {
                 Lista de serviços disponíveis: %s
                 """.formatted(String.join(", ", availableServices));
 
-            List<OllamaMessage> messages = List.of(
-                new OllamaMessage("system", systemPrompt),
-                new OllamaMessage("user", message)
-            );
-            LlmRouter.LlmResponse response = llmRouter.callStructured(
-                LlmRouter.Provider.OLLAMA, messages, 0.0, 20, true);
-            if (response.isError()) {
+            LlmRequest req = new LlmRequest();
+            req.systemPrompt = systemPrompt;
+            req.mensagemAtual = message;
+            req.temperatura = 0.0;
+            req.maxTokens = 20;
+            req.jsonMode = true;
+
+            LlmResponse response = poolExecutor.executar(req);
+            if (response == null || response.erro() || response.vazia()) {
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.text());
+            JsonNode node = objectMapper.readTree(response.texto());
             JsonNode serviceNode = node.path("service");
             if (serviceNode.isNull() || serviceNode.isMissingNode()) {
                 return Optional.empty();
@@ -110,7 +111,7 @@ public class OllamaSlotExtractor {
      * Ex: "pode ser a Maria" + ["Maria Silva", "Ana Costa"] → Optional.of("Maria Silva")
      */
     public Optional<String> extractProfessionalName(String message, List<String> availableProfessionals) {
-        if (!enabled || message == null || message.isBlank()
+        if (message == null || message.isBlank()
                 || availableProfessionals == null || availableProfessionals.isEmpty()) {
             return Optional.empty();
         }
@@ -131,17 +132,19 @@ public class OllamaSlotExtractor {
                 Profissionais disponíveis: %s
                 """.formatted(String.join(", ", availableProfessionals));
 
-            List<OllamaMessage> messages = List.of(
-                new OllamaMessage("system", systemPrompt),
-                new OllamaMessage("user", message)
-            );
-            LlmRouter.LlmResponse response = llmRouter.callStructured(
-                LlmRouter.Provider.OLLAMA, messages, 0.0, 20, true);
-            if (response.isError()) {
+            LlmRequest req = new LlmRequest();
+            req.systemPrompt = systemPrompt;
+            req.mensagemAtual = message;
+            req.temperatura = 0.0;
+            req.maxTokens = 20;
+            req.jsonMode = true;
+
+            LlmResponse response = poolExecutor.executar(req);
+            if (response == null || response.erro() || response.vazia()) {
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.text());
+            JsonNode node = objectMapper.readTree(response.texto());
             JsonNode profNode = node.path("professional");
             if (profNode.isNull() || profNode.isMissingNode()) {
                 return Optional.empty();
@@ -183,7 +186,7 @@ public class OllamaSlotExtractor {
      * Ex: "quanto custa?" → Optional.empty()
      */
     public Optional<Boolean> extractConfirmation(String message) {
-        if (!enabled || message == null || message.isBlank()) {
+        if (message == null || message.isBlank()) {
             return Optional.empty();
         }
 
@@ -201,17 +204,19 @@ public class OllamaSlotExtractor {
                 - null: mensagem ambígua ou fora de contexto de confirmação
                 """;
 
-            List<OllamaMessage> messages = List.of(
-                new OllamaMessage("system", systemPrompt),
-                new OllamaMessage("user", message)
-            );
-            LlmRouter.LlmResponse response = llmRouter.callStructured(
-                LlmRouter.Provider.OLLAMA, messages, 0.0, 15, true);
-            if (response.isError()) {
+            LlmRequest req = new LlmRequest();
+            req.systemPrompt = systemPrompt;
+            req.mensagemAtual = message;
+            req.temperatura = 0.0;
+            req.maxTokens = 15;
+            req.jsonMode = true;
+
+            LlmResponse response = poolExecutor.executar(req);
+            if (response == null || response.erro() || response.vazia()) {
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.text());
+            JsonNode node = objectMapper.readTree(response.texto());
             JsonNode confirmedNode = node.path("confirmed");
             if (confirmedNode.isNull() || confirmedNode.isMissingNode()) {
                 return Optional.empty();
@@ -247,7 +252,7 @@ public class OllamaSlotExtractor {
      * @return "MORNING", "AFTERNOON", "NIGHT" ou empty()
      */
     public Optional<String> extractTimePeriod(String message) {
-        if (!enabled || message == null || message.isBlank()) {
+        if (message == null || message.isBlank()) {
             return Optional.empty();
         }
 
@@ -266,17 +271,19 @@ public class OllamaSlotExtractor {
                 - null: não consegue determinar ou mensagem ambígua
                 """;
 
-            List<OllamaMessage> messages = List.of(
-                new OllamaMessage("system", systemPrompt),
-                new OllamaMessage("user", message)
-            );
-            LlmRouter.LlmResponse response = llmRouter.callStructured(
-                LlmRouter.Provider.OLLAMA, messages, 0.0, 15, true);
-            if (response.isError()) {
+            LlmRequest req = new LlmRequest();
+            req.systemPrompt = systemPrompt;
+            req.mensagemAtual = message;
+            req.temperatura = 0.0;
+            req.maxTokens = 15;
+            req.jsonMode = true;
+
+            LlmResponse response = poolExecutor.executar(req);
+            if (response == null || response.erro() || response.vazia()) {
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.text());
+            JsonNode node = objectMapper.readTree(response.texto());
             JsonNode periodNode = node.path("period");
             if (periodNode.isNull() || periodNode.isMissingNode()) {
                 return Optional.empty();
