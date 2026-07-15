@@ -27,9 +27,14 @@ public class ConversationStateManager {
     @Inject
     ObjectMapper objectMapper;
 
+    // A limpeza de conversas expiradas (deleteExpired) NÃO roda mais aqui — era um
+    // DELETE global disparado a cada mensagem recebida, de qualquer tenant, pagando
+    // essa escrita na latência do WhatsApp. Agora é responsabilidade exclusiva de
+    // ConversationStateCleanupScheduler, rodando em intervalo fixo independente de
+    // tráfego. Isso afeta somente o contexto de LLM (stateJson/chatHistory) — as
+    // mensagens do WhatsApp exibidas em painel vivem em outro serviço/banco.
     @Transactional
     public ConversationStateEntity loadOrCreate(UUID tenantId, String userIdentifier, Instant threshold) {
-        stateRepository.deleteExpired(threshold);
         return stateRepository.findActive(tenantId, userIdentifier, threshold)
                 .orElseGet(() -> createNew(tenantId, userIdentifier));
     }
