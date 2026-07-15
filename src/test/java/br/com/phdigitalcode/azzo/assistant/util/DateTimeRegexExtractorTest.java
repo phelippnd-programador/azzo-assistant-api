@@ -143,6 +143,48 @@ class DateTimeRegexExtractorTest {
         assertTrue(result.isEmpty());
     }
 
+    // ─── extractTimeLoose ─────────────────────────────────────────────────────
+
+    @ParameterizedTest(name = "'{0}' extrai 17:00")
+    @ValueSource(strings = {"17h", "17:00", "às 17", "as 17", "17 horas", "17hs"})
+    @DisplayName("formas explícitas/coloquiais de '17h' resolvem para 17:00")
+    void extractTimeLoose_dezessete(String input) {
+        Optional<String> result = DateTimeRegexExtractor.extractTimeLoose(input);
+        assertTrue(result.isPresent(), "esperava horário para '" + input + "'");
+        assertEquals("17:00", result.get());
+    }
+
+    @ParameterizedTest(name = "'{0}' extrai 17:00 (extenso)")
+    @ValueSource(strings = {"cinco da tarde", "5 da tarde", "às cinco da tarde", "cinco horas da tarde"})
+    @DisplayName("números por extenso com período resolvem para 17:00")
+    void extractTimeLoose_extenso(String input) {
+        Optional<String> result = DateTimeRegexExtractor.extractTimeLoose(input);
+        assertTrue(result.isPresent(), "esperava horário para '" + input + "'");
+        assertEquals("17:00", result.get());
+    }
+
+    @Test
+    @DisplayName("'amanhã à tarde às 17h' prioriza o horário específico (17:00)")
+    void extractTimeLoose_horarioTemPrioridadeSobrePeriodo() {
+        Optional<String> result = DateTimeRegexExtractor.extractTimeLoose("amanhã à tarde às 17h");
+        assertTrue(result.isPresent());
+        assertEquals("17:00", result.get());
+    }
+
+    @Test
+    @DisplayName("número solto sem âncora de horário/período não é reconhecido como horário")
+    void extractTimeLoose_numeroSoltoSemAncora_retornaEmpty() {
+        Optional<String> result = DateTimeRegexExtractor.extractTimeLoose("quero marcar duas pessoas");
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    @DisplayName("texto sem horário retorna Optional.empty()")
+    void extractTimeLoose_semHorario_retornaEmpty() {
+        Optional<String> result = DateTimeRegexExtractor.extractTimeLoose("quero agendar");
+        assertTrue(result.isEmpty());
+    }
+
     // ─── isAffirmative ────────────────────────────────────────────────────────
 
     @ParameterizedTest(name = "'{0}' deve ser afirmativo")

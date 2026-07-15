@@ -286,6 +286,12 @@ public class AssistantConversationService {
 
     // Processa ações — max 1 round-trip para evitar loops
     String finalReply = processActions(result, data, rawMessage, userIdentifier, tenantId, systemPrompt);
+    // Validação independente de modelo/provedor: nunca deixa entrar no histórico
+    // (nem ser enviada ao cliente) uma resposta que contradiz dados já confirmados
+    // no estado — ex.: "não identifiquei o profissional" quando data.professionalId
+    // já é conhecido. A causa raiz da contradição foi corrigida acima; isto é uma
+    // rede de segurança adicional, agnóstica a qual LLM do pool respondeu.
+    finalReply = sanitizeReplyAgainstKnownState(data, finalReply, tenantId);
 
     // Grava no histórico para próximos turnos (usa mensagem enriquecida para consistência)
     data.chatHistory.add(new ChatMessage("user", compactedMessage));
@@ -398,13 +404,27 @@ public class AssistantConversationService {
       String svcAlias = action.param("svc");
       String dateStr = action.param("date");
 
-      UUID professionalId = profAlias != null
-          ? agentSystemPromptBuilder.resolveProfessionalId(tenantId, profAlias).orElse(null)
-          : data.professionalId;
-      UUID serviceId = svcAlias != null
-          ? agentSystemPromptBuilder.resolveServiceId(tenantId, svcAlias).orElse(null)
-          : data.serviceId;
-      LocalDate date = dateStr != null ? LocalDate.parse(dateStr) : data.date;
+      // Fallback SEMPRE para o que já está no estado: se o LLM emitiu um alias que
+      // não resolve (ex.: usou o nome real em vez do alias interno), não descartamos
+      // um profissional/data já confirmados nesta conversa.
+      UUID professionalId = data.professionalId;
+      if (profAlias != null) {
+        Optional<UUID> resolved = agentSystemPromptBuilder.resolveProfessionalId(tenantId, profAlias);
+        if (resolved.isPresent()) professionalId = resolved.get();
+      }
+      UUID serviceId = data.serviceId;
+      if (svcAlias != null) {
+        Optional<UUID> resolved = agentSystemPromptBuilder.resolveServiceId(tenantId, svcAlias);
+        if (resolved.isPresent()) serviceId = resolved.get();
+      }
+      LocalDate date = data.date;
+      if (dateStr != null) {
+        try {
+          date = LocalDate.parse(dateStr);
+        } catch (RuntimeException ignored) {
+          // mantém a data já conhecida no estado se o LLM emitir uma data inválida
+        }
+      }
 
       if (professionalId == null || date == null) {
         return "Não consegui identificar o profissional ou a data. Tente novamente.";
@@ -2375,6 +2395,20 @@ public class AssistantConversationService {
     if ((data.time == null || data.time.isBlank()) && signals.time != null) {
       data.time = signals.time;
     }
+
+    // Prioridade do horário sobre o período (regra explícita): se já existe um
+    // horário específico, o período é sempre derivado dele — nunca perguntado —
+    // e substitui qualquer período anteriormente inferido de forma isolada.
+    if (data.time != null && !data.time.isBlank()) {
+      int hour = Integer.parseInt(data.time.substring(0, 2));
+      data.preferredPeriod = TimePeriod.fromHour(hour);
+    } else if (data.preferredPeriod == null && signals.preferredPeriod != null) {
+      try {
+        data.preferredPeriod = TimePeriod.valueOf(signals.preferredPeriod);
+      } catch (IllegalArgumentException ignored) {
+        // período desconhecido — mantém null e deixa o fluxo perguntar novamente
+      }
+    }
   }
 
   private boolean hasOperationalBookingLead(BookingLeadSignals signals) {
@@ -2384,7 +2418,8 @@ public class AssistantConversationService {
             || signals.professionalId != null
             || signals.professionalName != null
             || signals.date != null
-            || signals.time != null);
+            || signals.time != null
+            || signals.preferredPeriod != null);
   }
 
   private void syncBookingStageFromKnownSlots(ConversationData data) {
@@ -2441,22 +2476,70 @@ public class AssistantConversationService {
       return message;
     }
 
-    String pending = switch (data.stage) {
-      case ASK_NAME -> "nome do cliente";
-      case ASK_SERVICE -> "servico";
-      case ASK_PROFESSIONAL -> "profissional";
-      case ASK_DATE -> "data";
-      case ASK_PERIOD -> "periodo";
-      case ASK_TIME -> "horario";
-      case CONFIRMATION -> "confirmacao final";
-      default -> "proximo passo do agendamento";
-    };
+    // O horário específico sempre tem prioridade sobre o período: quando já
+    // conhecido, o próximo passo nunca é "perguntar período/horário de novo" —
+    // é consultar a disponibilidade. Essa checagem roda antes do switch por
+    // data.stage porque syncBookingStageFromKnownSlots pode deixar o rótulo
+    // ASK_TIME mesmo com o horário já resolvido (o campo só marca "falta pedir
+    // horário quando não houver período", não "horário desconhecido").
+    String pending;
+    if (data.time != null && !data.time.isBlank()) {
+      pending = "consultar disponibilidade (horario ja definido: " + data.time + ")";
+    } else {
+      pending = switch (data.stage) {
+        case ASK_NAME -> "nome do cliente";
+        case ASK_SERVICE -> "servico";
+        case ASK_PROFESSIONAL -> "profissional";
+        case ASK_DATE -> "data";
+        case ASK_PERIOD -> "periodo";
+        case ASK_TIME -> "horario";
+        case CONFIRMATION -> "confirmacao final";
+        default -> "proximo passo do agendamento";
+      };
+    }
 
     return message + "\n[Sistema: dados operacionais já identificados nesta conversa -> "
         + String.join(", ", recognized)
         + ". Conduza apenas o que falta agora: "
         + pending
         + ".]";
+  }
+
+  /**
+   * Camada de validação da resposta gerada, independente de qual provedor/modelo
+   * do pool respondeu: rejeita e substitui respostas que contradizem dados já
+   * confirmados no estado (backend é a fonte de verdade — nunca a LLM). Não
+   * persiste a resposta rejeitada; a substituta determinística é que vai para
+   * o histórico e para o cliente.
+   */
+  private String sanitizeReplyAgainstKnownState(ConversationData data, String reply, String tenantId) {
+    if (reply == null || reply.isBlank() || data == null) return reply;
+    String normalized = TextNormalizer.normalize(reply);
+
+    boolean claimsUnknownProfessionalOrDate =
+        normalized.contains("nao consegui identificar o profissional")
+            || normalized.contains("nao consegui identificar a data")
+            || normalized.contains("identificar o profissional ou a data");
+    if (data.professionalId != null && data.date != null && claimsUnknownProfessionalOrDate) {
+      LOG.warnf("[Agent] Resposta contraditoria descartada (profissional/data ja conhecidos no estado) — "
+          + "reply original='%s'", reply.length() > 120 ? reply.substring(0, 120) + "..." : reply);
+      return "Vou verificar os horários disponíveis para você. Um momento. 😊";
+    }
+
+    boolean asksKnownService = data.serviceId != null
+        && (normalized.contains("qual servico voce deseja") || normalized.contains("qual servico voce quer"));
+    boolean asksKnownProfessional = data.professionalId != null
+        && (normalized.contains("qual profissional voce prefere") || normalized.contains("com qual profissional"));
+    boolean asksKnownDate = data.date != null && normalized.contains("para qual dia");
+    boolean asksKnownPeriod = data.time != null && !data.time.isBlank()
+        && (normalized.contains("qual periodo voce prefere") || normalized.contains("de manha, tarde ou noite"));
+    if (asksKnownService || asksKnownProfessional || asksKnownDate || asksKnownPeriod) {
+      LOG.warnf("[Agent] Resposta redundante descartada (pediu dado ja preenchido no estado) — "
+          + "reply original='%s'", reply.length() > 120 ? reply.substring(0, 120) + "..." : reply);
+      return promptForSyncedStage(data, tenantId);
+    }
+
+    return reply;
   }
 
   private String preferredPeriodLabel(ConversationData data) {
@@ -2588,6 +2671,13 @@ public class AssistantConversationService {
       }
       return iniciarFluxoRemarcacao(data, userIdentifier, tenantId);
     }
+    if (intent == IntentType.GREETING) {
+      // Saudação pura, sem nenhum dado operacional na mensagem (já garantido pelo
+      // early-return acima): responde deterministicamente com o próximo campo
+      // realmente pendente, em vez de deixar o LLM "inventar" uma pergunta
+      // (ex.: pedir confirmação sem que exista nada a confirmar).
+      return promptForSyncedStage(data, tenantId);
+    }
     return null;
   }
 
@@ -2634,15 +2724,22 @@ public class AssistantConversationService {
     }
 
     LocalDate resolvedDate = DateTimeRegexExtractor.extractDate(rawMessage).orElse(null);
-    // extractTimeStrict requer HH:MM explícito — evita falsos positivos com ordinais ("1" → "01:00")
-    // e com dígitos de datas ("30/06" → "06:00")
-    String resolvedTime = DateTimeRegexExtractor.extractTimeStrict(rawMessage).map(this::normalizeTime).orElse(null);
+    // extractTimeLoose cobre HH:MM explícito e formas coloquiais ("17h", "às 17",
+    // "cinco da tarde") sem abrir mão da proteção contra falsos positivos com
+    // ordinais soltos ("1") ou dígitos de data ("30/06").
+    String resolvedTime = DateTimeRegexExtractor.extractTimeLoose(rawMessage).map(this::normalizeTime).orElse(null);
+    // Horário específico tem prioridade sobre período: só usamos o período explícito
+    // do texto quando nenhum horário foi reconhecido.
+    String resolvedPeriod = resolvedTime == null
+        ? TimePeriod.fromText(normalized).map(Enum::name).orElse(null)
+        : null;
 
     signals.date = resolvedDate != null ? resolvedDate.toString() : null;
     signals.time = resolvedTime;
+    signals.preferredPeriod = resolvedPeriod;
     signals.detected = bookingIntent && (signals.serviceId != null || signals.serviceName != null
         || signals.professionalId != null || signals.professionalName != null
-        || signals.date != null || signals.time != null);
+        || signals.date != null || signals.time != null || signals.preferredPeriod != null);
     return signals;
   }
 
@@ -2727,6 +2824,8 @@ public class AssistantConversationService {
     private String professionalName;
     private String date;
     private String time;
+    /** Período explícito (MORNING/AFTERNOON/NIGHT) mencionado em texto, sem horário exato. */
+    private String preferredPeriod;
   }
 
   private static final class PreparedSlotContext {

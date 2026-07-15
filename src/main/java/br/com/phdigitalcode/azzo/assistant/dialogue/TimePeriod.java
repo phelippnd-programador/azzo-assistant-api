@@ -26,4 +26,15 @@ public enum TimePeriod {
     if (value.contains("noite")) return Optional.of(NIGHT);
     return Optional.empty();
   }
+
+  /**
+   * Infere o período a partir de um horário específico já resolvido (0-23h).
+   * Usado quando o cliente informa um horário exato: o período deixa de ser
+   * perguntado e passa a ser derivado do horário, nunca o contrário.
+   */
+  public static TimePeriod fromHour(int hour) {
+    if (hour < 12) return MORNING;
+    if (hour < 18) return AFTERNOON;
+    return NIGHT;
+  }
 }

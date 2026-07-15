@@ -4,6 +4,8 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -15,6 +17,32 @@ public final class DateTimeRegexExtractor {
   private static final Pattern TIME = Pattern.compile("\\b([01]?\\d|2[0-3])(?:[:h]([0-5]\\d))?\\b");
   // Exige HH:MM (ou HHhMM) — sem isso não aceita bare ordinal como "1" ou dígito de data como "06"
   private static final Pattern TIME_STRICT = Pattern.compile("\\b([01]?\\d|2[0-3])[:h]([0-5]\\d)\\b");
+  // Hora "solta" seguida de sufixo horário explícito: "17h", "17hs", "17 horas", "17h00"
+  private static final Pattern TIME_H_SUFFIX =
+      Pattern.compile("\\b([01]?\\d|2[0-3])\\s*h(?:oras?|s)?(?:\\s*([0-5]\\d))?\\b");
+  // Preposição + número solto: "as 17", "às 17" (normalizado remove o acento)
+  private static final Pattern TIME_PREPOSITION = Pattern.compile("\\bas\\s+([01]?\\d|2[0-3])\\b");
+  // Dígito + período explícito: "5 da tarde"
+  private static final Pattern TIME_DIGIT_PERIOD =
+      Pattern.compile("\\b([01]?\\d|2[0-3])\\s+da\\s+(manha|tarde|noite)\\b");
+
+  private static final Map<String, Integer> NUMBER_WORDS = new LinkedHashMap<>();
+  static {
+    NUMBER_WORDS.put("uma", 1);
+    NUMBER_WORDS.put("um", 1);
+    NUMBER_WORDS.put("duas", 2);
+    NUMBER_WORDS.put("dois", 2);
+    NUMBER_WORDS.put("tres", 3);
+    NUMBER_WORDS.put("quatro", 4);
+    NUMBER_WORDS.put("cinco", 5);
+    NUMBER_WORDS.put("seis", 6);
+    NUMBER_WORDS.put("sete", 7);
+    NUMBER_WORDS.put("oito", 8);
+    NUMBER_WORDS.put("nove", 9);
+    NUMBER_WORDS.put("dez", 10);
+    NUMBER_WORDS.put("onze", 11);
+    NUMBER_WORDS.put("doze", 12);
+  }
 
   private DateTimeRegexExtractor() {}
 
@@ -71,6 +99,82 @@ public final class DateTimeRegexExtractor {
 
     int hour = Integer.parseInt(matcher.group(1));
     int minute = Integer.parseInt(matcher.group(2));
+    try {
+      return Optional.of(LocalTime.of(hour, minute).toString());
+    } catch (RuntimeException ignored) {
+      return Optional.empty();
+    }
+  }
+
+  /**
+   * Extrai horário de expressões coloquiais que extractTimeStrict não cobre:
+   * "17h", "17hs", "17 horas", "às 17", "as 17", "5 da tarde", "cinco da tarde",
+   * "cinco horas da tarde". Agnóstico a modelo/provedor — resolução 100% determinística.
+   * Sempre prioriza o padrão mais explícito (HH:MM) antes de tentar formas soltas.
+   */
+  public static Optional<String> extractTimeLoose(String text) {
+    Optional<String> strict = extractTimeStrict(text);
+    if (strict.isPresent()) return strict;
+
+    String normalized = TextNormalizer.normalize(text);
+
+    Matcher hSuffix = TIME_H_SUFFIX.matcher(normalized);
+    if (hSuffix.find()) {
+      int hour = Integer.parseInt(hSuffix.group(1));
+      int minute = hSuffix.group(2) == null ? 0 : Integer.parseInt(hSuffix.group(2));
+      Optional<String> resolved = toTimeString(hour, minute);
+      if (resolved.isPresent()) return resolved;
+    }
+
+    Matcher digitPeriod = TIME_DIGIT_PERIOD.matcher(normalized);
+    if (digitPeriod.find()) {
+      int hour = applyPeriodOffset(Integer.parseInt(digitPeriod.group(1)), digitPeriod.group(2));
+      Optional<String> resolved = toTimeString(hour, 0);
+      if (resolved.isPresent()) return resolved;
+    }
+
+    Optional<String> wordExtenso = extractTimeFromNumberWord(normalized);
+    if (wordExtenso.isPresent()) return wordExtenso;
+
+    Matcher preposition = TIME_PREPOSITION.matcher(normalized);
+    if (preposition.find()) {
+      int hour = Integer.parseInt(preposition.group(1));
+      return toTimeString(hour, 0);
+    }
+
+    return Optional.empty();
+  }
+
+  /**
+   * Casa números por extenso ("cinco", "meio-dia" não incluso) apenas quando
+   * acompanhados de uma âncora clara — "horas"/"hs" ou período do dia — para não
+   * confundir números soltos em frases sem relação com horário.
+   */
+  private static Optional<String> extractTimeFromNumberWord(String normalized) {
+    boolean hasHourAnchor = normalized.contains("hora");
+    Matcher period = Pattern.compile("\\bda\\s+(manha|tarde|noite)\\b").matcher(normalized);
+    String periodWord = period.find() ? period.group(1) : null;
+    if (!hasHourAnchor && periodWord == null) return Optional.empty();
+
+    for (Map.Entry<String, Integer> entry : NUMBER_WORDS.entrySet()) {
+      Matcher wordMatcher = Pattern.compile("\\b" + entry.getKey() + "\\b").matcher(normalized);
+      if (wordMatcher.find()) {
+        int hour = applyPeriodOffset(entry.getValue(), periodWord);
+        return toTimeString(hour, 0);
+      }
+    }
+    return Optional.empty();
+  }
+
+  private static int applyPeriodOffset(int hour, String periodWord) {
+    if (periodWord == null) return hour;
+    if (("tarde".equals(periodWord) || "noite".equals(periodWord)) && hour < 12) {
+      return hour + 12;
+    }
+    return hour;
+  }
+
+  private static Optional<String> toTimeString(int hour, int minute) {
     try {
       return Optional.of(LocalTime.of(hour, minute).toString());
     } catch (RuntimeException ignored) {
