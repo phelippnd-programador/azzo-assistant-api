@@ -87,7 +87,7 @@ public class AssistantConversationService {
   String greetingZone;
   @ConfigProperty(name = "assistant.intent.min-confidence", defaultValue = "0.62")
   double minIntentConfidence;
-  @ConfigProperty(name = "assistant.ollama.min-confidence", defaultValue = "0.75")
+  @ConfigProperty(name = "assistant.llm.intent-min-confidence", defaultValue = "0.75")
   double ollamaMinConfidence;
   @ConfigProperty(name = "assistant.agent.enabled", defaultValue = "false")
   boolean agentEnabled;
