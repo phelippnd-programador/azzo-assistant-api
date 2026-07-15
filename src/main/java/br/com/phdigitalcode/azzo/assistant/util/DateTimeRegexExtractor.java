@@ -14,7 +14,10 @@ public final class DateTimeRegexExtractor {
 
   private static final Pattern DATE_DMY = Pattern.compile("\\b(\\d{1,2})[/-](\\d{1,2})(?:[/-](\\d{2,4}))?\\b");
   private static final Pattern DATE_YMD = Pattern.compile("\\b(\\d{4})-(\\d{2})-(\\d{2})\\b");
-  private static final Pattern TIME = Pattern.compile("\\b([01]?\\d|2[0-3])(?:[:h]([0-5]\\d))?\\b");
+  // O "h" sozinho (sem minutos, ex.: "10h", "9h") também é um match válido —
+  // sem essa alternativa literal, o \b final falhava (dígito e "h" são ambos
+  // \w, então não há fronteira entre eles quando não sobra nada depois do "h").
+  private static final Pattern TIME = Pattern.compile("\\b([01]?\\d|2[0-3])(?:[:h]([0-5]\\d)|h)?\\b");
   // Exige HH:MM (ou HHhMM) — sem isso não aceita bare ordinal como "1" ou dígito de data como "06"
   private static final Pattern TIME_STRICT = Pattern.compile("\\b([01]?\\d|2[0-3])[:h]([0-5]\\d)\\b");
   // Hora "solta" seguida de sufixo horário explícito: "17h", "17hs", "17 horas", "17h00"

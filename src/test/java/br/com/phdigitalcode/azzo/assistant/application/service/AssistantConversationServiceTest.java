@@ -110,7 +110,6 @@ class AssistantConversationServiceTest {
     /** Configura stateRepository para novo usuário (sem estado persistido). */
     private void setupNovoUsuario() {
         when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
-        when(stateRepository.deleteExpired(any())).thenReturn(0L);
         when(stateRepository.findActive(eq(tenantId), eq(USER_ID), any()))
                 .thenReturn(Optional.empty());
 //        doNothing().when(stateRepository).persist(any());
@@ -119,7 +118,6 @@ class AssistantConversationServiceTest {
     /** Configura stateRepository para usuário com estado pré-existente. */
     private void setupUsuarioComEstado(ConversationData data) throws Exception {
         when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
-        when(stateRepository.deleteExpired(any())).thenReturn(0L);
         when(stateRepository.findActive(eq(tenantId), eq(USER_ID), any()))
                 .thenReturn(Optional.of(entityComEstado(data)));
 //        doNothing().when(stateRepository).persist(any());
@@ -322,7 +320,6 @@ class AssistantConversationServiceTest {
     @DisplayName("process: JSON corrompido no estado → reinicia conversa sem erro")
     void process_jsonCorrompido_reiniciaConversa() throws Exception {
         when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
-        when(stateRepository.deleteExpired(any())).thenReturn(0L);
 
         // Entidade com JSON inválido
         ConversationStateEntity entityCorrompida = new ConversationStateEntity();

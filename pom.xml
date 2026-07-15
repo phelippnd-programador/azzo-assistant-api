@@ -81,6 +81,12 @@
       <artifactId>quarkus-cache</artifactId>
     </dependency>
 
+    <!-- Scheduler: limpeza periódica de conversas expiradas (contexto de LLM) -->
+    <dependency>
+      <groupId>io.quarkus</groupId>
+      <artifactId>quarkus-scheduler</artifactId>
+    </dependency>
+
     <!-- OpenNLP -->
     <dependency>
       <groupId>org.apache.opennlp</groupId>

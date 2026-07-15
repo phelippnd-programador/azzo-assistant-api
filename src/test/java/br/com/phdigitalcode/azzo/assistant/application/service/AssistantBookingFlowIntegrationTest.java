@@ -109,14 +109,12 @@ class AssistantBookingFlowIntegrationTest {
 
     private void setupNovoUsuario() {
         when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
-        doNothing().when(stateRepository).deleteExpired(any());
         when(stateRepository.findActive(eq(tenantId), eq(USER_ID), any()))
                 .thenReturn(Optional.empty());
     }
 
     private void setupUsuarioComEstado(ConversationData data) throws Exception {
         when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
-        doNothing().when(stateRepository).deleteExpired(any());
         ConversationStateEntity entity = new ConversationStateEntity();
         entity.tenantId    = tenantId;
         entity.userIdentifier = USER_ID;
