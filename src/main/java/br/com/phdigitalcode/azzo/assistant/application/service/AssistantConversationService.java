@@ -60,6 +60,32 @@ public class AssistantConversationService {
   private static final DateTimeFormatter DATE_BR_FORMATTER = DateTimeFormatter.ofPattern("dd/MM/yyyy");
   private static final Pattern CENTS_CURRENCY_PATTERN = Pattern.compile("R\\$(\\d{3,})\\b");
 
+  // Item 12: detecção estrutural de contradição em sanitizeReplyAgainstKnownState.
+  // Operam sobre o texto já normalizado (minúsculo, sem acento — ver TextNormalizer):
+  // pegam paráfrases do LLM que RE-PERGUNTAM um slot já preenchido ou afirmam NÃO
+  // conhecê-lo, sem depender das frases fixas. O limitador [^.?!\r\n]{0,N} mantém a
+  // pista interrogativa e o termo do slot dentro da MESMA cláusula (evita casar entre
+  // frases distintas); \b evita casar "que" dentro de "porque"/"aquele", etc. Janela
+  // curta ({0,15}) nas re-perguntas para não confundir menções incidentais do termo
+  // (ex.: "qual forma de pagamento para o servico?") com uma re-pergunta do slot.
+  private static final Pattern REASK_SERVICE = Pattern.compile(
+      "\\b(qual|quais|que|informe|me diga|me informe|gostaria de saber)\\b[^.?!\\r\\n]{0,15}"
+          + "\\b(servico|servicos|procedimento|procedimentos|atendimento)\\b");
+  private static final Pattern REASK_PROFESSIONAL = Pattern.compile(
+      "\\b(qual|com qual|quais|que|informe|me diga|me informe|gostaria de saber)\\b[^.?!\\r\\n]{0,15}"
+          + "\\b(profissional|profissionais|especialista|especialistas)\\b");
+  private static final Pattern REASK_DATE = Pattern.compile(
+      "\\b(qual|para qual|que|para que|informe|me diga|me informe|gostaria de saber)\\b[^.?!\\r\\n]{0,15}"
+          + "\\b(dia|data)\\b");
+  private static final Pattern REASK_TIME = Pattern.compile(
+      "\\b(qual|a que|que|informe|me diga|me informe|gostaria de saber)\\b[^.?!\\r\\n]{0,15}"
+          + "\\b(horario|horarios|hora|horas)\\b");
+  private static final Pattern CLAIM_UNKNOWN_SLOT = Pattern.compile(
+      "\\bnao\\b[^.?!\\r\\n]{0,25}"
+          + "\\b(consegui|identifiquei|identificar|entendi|entender|sei|saber|encontrei|encontrar|localizei|localizar)\\b"
+          + "[^.?!\\r\\n]{0,25}"
+          + "\\b(servico|procedimento|atendimento|profissional|especialista|data|dia|horario|hora)\\b");
+
   @Inject OpenNLPIntentClassifier intentClassifier;
   @Inject OllamaIntentService ollamaIntentService;
   @Inject OllamaDateEnricher ollamaDateEnricher;
@@ -70,6 +96,7 @@ public class AssistantConversationService {
   @Inject AssistantDomainService domainService;
   @Inject ConversationStateRepository stateRepository;
   @Inject ConversationStateManager stateManager;
+  @Inject ConversationLockManager lockManager;
   @Inject ContextoTenant contextoTenant;
   @Inject ObjectMapper objectMapper;
   @Inject AgentSystemPromptBuilder agentSystemPromptBuilder;
@@ -111,6 +138,22 @@ public class AssistantConversationService {
       userName = domainService.resolveRegisteredCustomerName(tenantIdStr, userIdentifier).orElse(null);
     }
 
+    // Serializa por tenant+telefone: evita que duas mensagens quase simultâneas do
+    // mesmo cliente carreguem o mesmo estado em paralelo (TX de load curta) e, minutos
+    // depois, uma sobrescreva o stateJson salvo pela outra ("lost update"), ou que ambas
+    // não encontrem conversa ativa e criem linhas de estado duplicadas. O lock cobre
+    // também a chamada ao LLM (lenta, 30-120s) — ver ConversationLockManager para a
+    // limitação conhecida (só serializa dentro desta instância/réplica).
+    String lockKey = tenantIdStr + ":" + userIdentifier;
+    // userName é reatribuído acima (linha ~112), então precisa de uma cópia
+    // efetivamente final para ser capturada pela lambda.
+    String resolvedUserName = userName;
+    return lockManager.withLock(lockKey,
+        () -> processLocked(rawMessage, tenantId, tenantIdStr, userIdentifier, resolvedUserName));
+  }
+
+  private AssistantMessageResponse processLocked(String rawMessage, UUID tenantId, String tenantIdStr,
+      String userIdentifier, String userName) {
     // TX 1: carrega estado (< 50ms)
     Instant threshold = Instant.now().minus(Duration.ofMinutes(ttlMinutes));
     ConversationStateEntity entity = stateManager.loadOrCreate(tenantId, userIdentifier, threshold);
@@ -381,6 +424,16 @@ public class AssistantConversationService {
       // pular essa etapa, seguramos a criação e fazemos a pergunta nós mesmos.
       if (!(isConfirmationPending(data.chatHistory) && isAffirmativeResponse(rawMessage))) {
         applyBookingActionSlots(bookAction, data, tenantId);
+        // Item 10: não pedir confirmação de um horário fora do expediente/indisponível.
+        // O horário pode ter chegado numa mensagem composta (aplicado por
+        // applyBookingLeadSignals) ou na própria action do LLM. Sem esta checagem, a
+        // pergunta de confirmação era enviada mesmo assim e só o "sim" do cliente é que
+        // esbarrava no isSlotAvailable — um ciclo extra de mensagens. Reaproveita o
+        // mesmo helper do Fix 2 para reoferecer horários de forma consistente.
+        String unavailableReply = rejectFilledTimeIfUnavailable(data, tenantId);
+        if (unavailableReply != null) {
+          return unavailableReply;
+        }
         data.stage = ConversationStage.CONFIRMATION;
         LOG.infof("[Agent] CRIAR_AGENDAMENTO sem confirmacao previa — pedindo confirmacao ao cliente");
         return buildBookingConfirmationQuestion(data);
@@ -584,9 +637,21 @@ public class AssistantConversationService {
         return buildUnavailableSelectedTimeReply(data, tenantId);
       }
 
-      UUID appointmentId = domainService.createPendingAppointment(
-          tenantId, data.serviceId, data.professionalId, data.date, data.time,
-          userIdentifier, data.customerName);
+      UUID appointmentId;
+      try {
+        appointmentId = domainService.createPendingAppointment(
+            tenantId, data.serviceId, data.professionalId, data.date, data.time,
+            userIdentifier, data.customerName);
+      } catch (IllegalStateException e) {
+        // Mesmo conflito tratado no modo legado (ver handleMessage/RuntimeException em
+        // torno da linha 1202): o slot foi verificado disponível acima, mas outro
+        // cliente reservou entre a checagem e a criação. Em vez de devolver uma
+        // mensagem de erro fixa e deixar o cliente preso tentando confirmar um horário
+        // que já se sabe indisponível, limpamos o horário e reoferecemos opções novas.
+        LOG.infof("[Agent] Conflito ao criar agendamento (race condition): tenant=%s horario=%s erro=%s",
+            tenantId, data.time, e.getMessage());
+        return buildUnavailableSelectedTimeReply(data, tenantId);
+      }
       domainService.confirmAppointment(tenantId, appointmentId, userIdentifier);
       data.appointmentId = appointmentId;
       data.stage = ConversationStage.COMPLETED;
@@ -621,6 +686,34 @@ public class AssistantConversationService {
     }
     reply.append("Pode escolher pelo numero ou digitando o horario.");
     return reply.toString().trim();
+  }
+
+  /**
+   * Item 10: antes de avançar para a etapa de confirmação com um horário já preenchido,
+   * valida esse horário contra a disponibilidade real do profissional (expediente +
+   * conflitos), usando a mesma checagem {@code isSlotAvailable} que gate a criação em
+   * {@link #executeCriarAgendamento}. Se o horário for inválido/indisponível, não
+   * confirma: reoferece opções via {@link #buildUnavailableSelectedTimeReply} (que
+   * limpa {@code data.time} e volta o estágio para {@code ASK_TIME}).
+   *
+   * <p>Retorna a resposta pronta ao cliente quando há rejeição, ou {@code null} quando
+   * não há o que rejeitar — horário livre, ou dados insuficientes para checar
+   * disponibilidade (serviço/profissional/data ausentes), caso em que o fluxo normal
+   * segue e as validações a jusante cuidam dos slots faltantes.
+   */
+  private String rejectFilledTimeIfUnavailable(ConversationData data, String tenantId) {
+    if (data.time == null || data.time.isBlank()) {
+      return null;
+    }
+    if (data.serviceId == null || data.professionalId == null || data.date == null) {
+      return null;
+    }
+    if (!domainService.isSlotAvailable(tenantId, data.professionalId, data.date, data.time, data.serviceId)) {
+      LOG.infof("[Agent] Horario preenchido indisponivel antes da confirmacao: prof=%s data=%s hora=%s",
+          data.professionalId, data.date, data.time);
+      return buildUnavailableSelectedTimeReply(data, tenantId);
+    }
+    return null;
   }
 
   private String buildDeterministicBookingConfirmationReply(ConversationData data, String toolResult) {
@@ -704,6 +797,18 @@ public class AssistantConversationService {
 
     BookingLeadSignals bookingLead = detectBookingLeadSignals(rawMessage, data, tenantId);
     applyBookingLeadSignals(data, bookingLead);
+    // Validação hard: nunca deixar um agendamento retroativo passar pelo modo legado.
+    // applyBookingLeadSignals seta data.date direto a partir do sinal detectado
+    // (bookingLead.date, vindo de regex/LLM), sem passar pela checagem de data retroativa
+    // que só existe no caminho de extração manual logo abaixo (linha ~1057). Sem isso,
+    // uma data passada ficava presa em data.date e o fluxo avançava direto para
+    // período/horário sem nunca reavaliar a data (o bloco "if (data.date == null)" era
+    // pulado, já que data.date != null). Mesma regra aplicada no modo agente
+    // (ver executeCriarAgendamento, linha ~587).
+    if (data.date != null && data.date.isBefore(LocalDate.now())) {
+      LOG.warnf("Tentativa de agendamento retroativo bloqueada (modo legado, via bookingLead): date=%s", data.date);
+      data.date = null;
+    }
     syncBookingStageFromKnownSlots(data);
     boolean hasOperationalBookingLead = hasOperationalBookingLead(bookingLead);
 
@@ -2539,7 +2644,42 @@ public class AssistantConversationService {
       return promptForSyncedStage(data, tenantId);
     }
 
+    // Item 12: camada estrutural — pega paráfrases do LLM que reintroduzem a mesma
+    // classe de bug (re-perguntar ou negar um slot já preenchido no estado) que as
+    // frases fixas acima não cobrem, mantendo-se agnóstica ao provedor/modelo do pool.
+    if (structurallyContradictsKnownState(data, normalized)) {
+      LOG.warnf("[Agent] Resposta contraditoria descartada (deteccao estrutural, item 12) — "
+          + "reply original='%s'", reply.length() > 120 ? reply.substring(0, 120) + "..." : reply);
+      return promptForSyncedStage(data, tenantId);
+    }
+
     return reply;
+  }
+
+  /**
+   * Item 12: retorna {@code true} quando a resposta {@code normalized} re-pergunta um
+   * slot já preenchido (serviço, profissional, data ou horário) ou afirma não conhecê-lo,
+   * detectado de forma estrutural (regex de pista interrogativa/negação próxima ao termo
+   * do slot), independente do fraseado exato. Só dispara para slots que de fato já estão
+   * preenchidos no estado — o backend é a fonte de verdade.
+   */
+  private boolean structurallyContradictsKnownState(ConversationData data, String normalized) {
+    if (normalized == null || normalized.isBlank()) return false;
+    boolean serviceFilled = data.serviceId != null;
+    boolean professionalFilled = data.professionalId != null;
+    boolean dateFilled = data.date != null;
+    boolean timeFilled = data.time != null && !data.time.isBlank();
+
+    boolean reasksFilledSlot =
+        (serviceFilled && REASK_SERVICE.matcher(normalized).find())
+            || (professionalFilled && REASK_PROFESSIONAL.matcher(normalized).find())
+            || (dateFilled && REASK_DATE.matcher(normalized).find())
+            || (timeFilled && REASK_TIME.matcher(normalized).find());
+    if (reasksFilledSlot) return true;
+
+    // Nega conhecer um slot enquanto os slots operacionais centrais já estão preenchidos.
+    return (serviceFilled || professionalFilled || dateFilled)
+        && CLAIM_UNKNOWN_SLOT.matcher(normalized).find();
   }
 
   private String preferredPeriodLabel(ConversationData data) {

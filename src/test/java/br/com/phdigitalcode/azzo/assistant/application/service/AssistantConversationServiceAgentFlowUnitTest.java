@@ -58,6 +58,7 @@ class AssistantConversationServiceAgentFlowUnitTest {
     @Mock ContextoTenant contextoTenant;
     @Mock AgentSystemPromptBuilder agentSystemPromptBuilder;
     @Mock LlmBookingAgent llmBookingAgent;
+    @Mock ConversationLockManager lockManager;
 
     @Spy
     ObjectMapper objectMapper = buildObjectMapper();
@@ -97,6 +98,12 @@ class AssistantConversationServiceAgentFlowUnitTest {
         lenient().when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
         lenient().when(stateRepository.deleteExpired(any())).thenReturn(0L);
         lenient().when(agentSystemPromptBuilder.build(anyString())).thenReturn("SYSTEM_PROMPT_STUB");
+        // ConversationLockManager só serializa por chave tenant+telefone; em teste unitário
+        // basta executar a ação recebida diretamente, sem lock real (ver Fix 1).
+        lenient().when(lockManager.withLock(anyString(), any())).thenAnswer(invocation -> {
+            java.util.function.Supplier<?> action = invocation.getArgument(1);
+            return action.get();
+        });
     }
 
     private void setPrivateField(String fieldName, Object value) throws Exception {
@@ -115,8 +122,18 @@ class AssistantConversationServiceAgentFlowUnitTest {
     }
 
     private void setupUsuarioComEstado(ConversationData data) throws Exception {
-        when(stateRepository.findActive(eq(tenantId), eq(USER_ID), any()))
-                .thenReturn(Optional.of(entityComEstado(data)));
+        // entityComEstado() interage com o @Spy objectMapper (writeValueAsString). Computa a
+        // entidade ANTES de abrir o when(...) para não disparar UnfinishedStubbing do Mockito.
+        // O carregamento de estado em produção passa por stateManager.loadOrCreate (após o
+        // refactor de limpeza de conversas via scheduler) — é esse o ponto a stubar, não o
+        // stateRepository.findActive direto.
+        ConversationStateEntity entity = entityComEstado(data);
+        when(stateManager.loadOrCreate(eq(tenantId), anyString(), any()))
+                .thenReturn(entity);
+        // processLocked desserializa o estado via stateManager.parseState(); devolve o
+        // próprio objeto de estado do teste (mais fiel que depender do round-trip JSON).
+        when(stateManager.parseState(anyString()))
+                .thenReturn(data);
     }
 
     // ─── Sintoma 1: saudação não deve inventar "Confirma?" ───────────────────────
@@ -219,5 +236,86 @@ class AssistantConversationServiceAgentFlowUnitTest {
 
         assertFalse(response.reply.toLowerCase().contains("nao consegui identificar"),
                 "Resposta contraditória não deveria chegar ao cliente. Reply: " + response.reply);
+    }
+
+    // ─── Fix 2: conflito de horário (race condition) ao criar o agendamento ─────
+
+    @Test
+    @DisplayName("Confirmação 'sim' com horário que virou indisponível entre a checagem e a criação (IllegalStateException do domainService) reoferece horários em vez de propagar o erro ao cliente")
+    void confirmacaoComConflitoDeHorario_reofereceHorariosEmVezDePropagarErro() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte Masculino";
+        estado.professionalId = professionalId;
+        estado.professionalName = "Riane";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.time = "17:00";
+        estado.preferredPeriod = TimePeriod.AFTERNOON;
+        estado.stage = ConversationStage.CONFIRMATION;
+        setupUsuarioComEstado(estado);
+
+        // resolveIntentWithLlmPriority classifica a mensagem antes do handler determinístico
+        // de confirmação; sem este stub o classificador (mock) retorna null e dá NPE. O "sim"
+        // é interceptado por handleAgentBookingConfirmationFlow antes de qualquer chamada ao LLM.
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+
+        // isSlotAvailable() ainda vê o horário como livre (checagem "otimista"), mas
+        // outro cliente reserva entre essa checagem e o INSERT — o service de domínio
+        // relança isso como IllegalStateException.
+        when(domainService.isSlotAvailable(eq(tenantId.toString()), eq(professionalId), eq(estado.date), eq("17:00"), eq(serviceId)))
+                .thenReturn(true);
+        when(domainService.createPendingAppointment(eq(tenantId.toString()), eq(serviceId), eq(professionalId),
+                eq(estado.date), eq("17:00"), eq(USER_ID), eq(USER_NAME)))
+                .thenThrow(new IllegalStateException("Horario indisponivel para criacao do agendamento"));
+        when(domainService.suggestTimes(eq(tenantId.toString()), eq(professionalId), eq(estado.date), eq(serviceId), any()))
+                .thenReturn(List.of("18:00", "18:30"));
+
+        AssistantMessageResponse response = service.process("sim", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        assertEquals(ConversationStage.ASK_TIME, response.stage,
+                "Deve voltar a pedir horário em vez de deixar a exceção do banco propagar. Reply: " + response.reply);
+        assertTrue(response.reply.contains("18:00") && response.reply.contains("18:30"),
+                "Deve reoferecer os novos horários disponíveis em vez de uma mensagem de erro genérica. Reply: " + response.reply);
+        // O conflito é tratado deterministicamente — não deveria custar uma chamada ao LLM.
+        verify(llmBookingAgent, never()).chat(anyString(), anyList(), anyString(), any(), any());
+    }
+
+    // ─── Item 12: paráfrase contraditória (não coberta pelas frases fixas) ───────
+
+    @Test
+    @DisplayName("Item 12: paráfrase da LLM re-perguntando um slot já preenchido (que escapa das frases fixas) é descartada pela detecção estrutural")
+    void parafraseContraditoria_eDescartadaPelaDeteccaoEstrutural() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte Masculino";
+        estado.professionalId = professionalId;
+        estado.professionalName = "Riane";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.time = "17:00";
+        estado.preferredPeriod = TimePeriod.AFTERNOON;
+        estado.stage = ConversationStage.ASK_TIME;
+        setupUsuarioComEstado(estado);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+        // Paráfrase deliberada: NÃO contém nenhuma das frases fixas checadas
+        // ("qual servico voce deseja/quer"), então só a camada estrutural do item 12
+        // (REASK_SERVICE: "qual ... servico") consegue barrá-la. Serviço já está
+        // preenchido no estado → é uma contradição.
+        String parafrase = "Poderia me dizer novamente qual é o serviço desejado?";
+        when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
+                .thenReturn(new LlmBookingAgent.AgentResult(parafrase, List.of(), "POOL"));
+
+        AssistantMessageResponse response = service.process("pode ser", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        assertFalse(response.reply.toLowerCase().contains("servico desejado")
+                        || response.reply.toLowerCase().contains("serviço desejado"),
+                "A paráfrase que re-pergunta um serviço já conhecido não deveria chegar ao cliente. Reply: " + response.reply);
+        assertFalse(response.reply.isBlank(), "Deve haver uma resposta determinística substituta. Reply: " + response.reply);
     }
 }
