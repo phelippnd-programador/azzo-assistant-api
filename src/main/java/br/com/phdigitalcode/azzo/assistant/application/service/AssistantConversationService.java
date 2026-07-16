@@ -70,6 +70,7 @@ public class AssistantConversationService {
   @Inject AssistantDomainService domainService;
   @Inject ConversationStateRepository stateRepository;
   @Inject ConversationStateManager stateManager;
+  @Inject ConversationLockManager lockManager;
   @Inject ContextoTenant contextoTenant;
   @Inject ObjectMapper objectMapper;
   @Inject AgentSystemPromptBuilder agentSystemPromptBuilder;
@@ -111,6 +112,22 @@ public class AssistantConversationService {
       userName = domainService.resolveRegisteredCustomerName(tenantIdStr, userIdentifier).orElse(null);
     }
 
+    // Serializa por tenant+telefone: evita que duas mensagens quase simultâneas do
+    // mesmo cliente carreguem o mesmo estado em paralelo (TX de load curta) e, minutos
+    // depois, uma sobrescreva o stateJson salvo pela outra ("lost update"), ou que ambas
+    // não encontrem conversa ativa e criem linhas de estado duplicadas. O lock cobre
+    // também a chamada ao LLM (lenta, 30-120s) — ver ConversationLockManager para a
+    // limitação conhecida (só serializa dentro desta instância/réplica).
+    String lockKey = tenantIdStr + ":" + userIdentifier;
+    // userName é reatribuído acima (linha ~112), então precisa de uma cópia
+    // efetivamente final para ser capturada pela lambda.
+    String resolvedUserName = userName;
+    return lockManager.withLock(lockKey,
+        () -> processLocked(rawMessage, tenantId, tenantIdStr, userIdentifier, resolvedUserName));
+  }
+
+  private AssistantMessageResponse processLocked(String rawMessage, UUID tenantId, String tenantIdStr,
+      String userIdentifier, String userName) {
     // TX 1: carrega estado (< 50ms)
     Instant threshold = Instant.now().minus(Duration.ofMinutes(ttlMinutes));
     ConversationStateEntity entity = stateManager.loadOrCreate(tenantId, userIdentifier, threshold);
@@ -381,6 +398,16 @@ public class AssistantConversationService {
       // pular essa etapa, seguramos a criação e fazemos a pergunta nós mesmos.
       if (!(isConfirmationPending(data.chatHistory) && isAffirmativeResponse(rawMessage))) {
         applyBookingActionSlots(bookAction, data, tenantId);
+        // Item 10: não pedir confirmação de um horário fora do expediente/indisponível.
+        // O horário pode ter chegado numa mensagem composta (aplicado por
+        // applyBookingLeadSignals) ou na própria action do LLM. Sem esta checagem, a
+        // pergunta de confirmação era enviada mesmo assim e só o "sim" do cliente é que
+        // esbarrava no isSlotAvailable — um ciclo extra de mensagens. Reaproveita o
+        // mesmo helper do Fix 2 para reoferecer horários de forma consistente.
+        String unavailableReply = rejectFilledTimeIfUnavailable(data, tenantId);
+        if (unavailableReply != null) {
+          return unavailableReply;
+        }
         data.stage = ConversationStage.CONFIRMATION;
         LOG.infof("[Agent] CRIAR_AGENDAMENTO sem confirmacao previa — pedindo confirmacao ao cliente");
         return buildBookingConfirmationQuestion(data);
@@ -584,9 +611,21 @@ public class AssistantConversationService {
         return buildUnavailableSelectedTimeReply(data, tenantId);
       }
 
-      UUID appointmentId = domainService.createPendingAppointment(
-          tenantId, data.serviceId, data.professionalId, data.date, data.time,
-          userIdentifier, data.customerName);
+      UUID appointmentId;
+      try {
+        appointmentId = domainService.createPendingAppointment(
+            tenantId, data.serviceId, data.professionalId, data.date, data.time,
+            userIdentifier, data.customerName);
+      } catch (IllegalStateException e) {
+        // Mesmo conflito tratado no modo legado (ver handleMessage/RuntimeException em
+        // torno da linha 1202): o slot foi verificado disponível acima, mas outro
+        // cliente reservou entre a checagem e a criação. Em vez de devolver uma
+        // mensagem de erro fixa e deixar o cliente preso tentando confirmar um horário
+        // que já se sabe indisponível, limpamos o horário e reoferecemos opções novas.
+        LOG.infof("[Agent] Conflito ao criar agendamento (race condition): tenant=%s horario=%s erro=%s",
+            tenantId, data.time, e.getMessage());
+        return buildUnavailableSelectedTimeReply(data, tenantId);
+      }
       domainService.confirmAppointment(tenantId, appointmentId, userIdentifier);
       data.appointmentId = appointmentId;
       data.stage = ConversationStage.COMPLETED;
@@ -704,6 +743,18 @@ public class AssistantConversationService {
 
     BookingLeadSignals bookingLead = detectBookingLeadSignals(rawMessage, data, tenantId);
     applyBookingLeadSignals(data, bookingLead);
+    // Validação hard: nunca deixar um agendamento retroativo passar pelo modo legado.
+    // applyBookingLeadSignals seta data.date direto a partir do sinal detectado
+    // (bookingLead.date, vindo de regex/LLM), sem passar pela checagem de data retroativa
+    // que só existe no caminho de extração manual logo abaixo (linha ~1057). Sem isso,
+    // uma data passada ficava presa em data.date e o fluxo avançava direto para
+    // período/horário sem nunca reavaliar a data (o bloco "if (data.date == null)" era
+    // pulado, já que data.date != null). Mesma regra aplicada no modo agente
+    // (ver executeCriarAgendamento, linha ~587).
+    if (data.date != null && data.date.isBefore(LocalDate.now())) {
+      LOG.warnf("Tentativa de agendamento retroativo bloqueada (modo legado, via bookingLead): date=%s", data.date);
+      data.date = null;
+    }
     syncBookingStageFromKnownSlots(data);
     boolean hasOperationalBookingLead = hasOperationalBookingLead(bookingLead);
 
