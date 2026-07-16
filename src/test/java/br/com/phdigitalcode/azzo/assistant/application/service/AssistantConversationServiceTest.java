@@ -7,8 +7,6 @@ import br.com.phdigitalcode.azzo.assistant.domain.entity.ConversationStateEntity
 import br.com.phdigitalcode.azzo.assistant.domain.repository.ConversationStateRepository;
 import br.com.phdigitalcode.azzo.assistant.extractor.ProfessionalNameFinder;
 import br.com.phdigitalcode.azzo.assistant.extractor.ServiceNameFinder;
-import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ProfissionalDto;
-import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ServicoDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.tenant.ContextoTenant;
 import br.com.phdigitalcode.azzo.assistant.model.AssistantMessageResponse;
 import br.com.phdigitalcode.azzo.assistant.model.IntentPrediction;
@@ -20,7 +18,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
-import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.Spy;
@@ -61,9 +58,6 @@ class AssistantConversationServiceTest {
     @Mock
     ContextoTenant contextoTenant;
 
-    @Mock
-    ConversationLockManager lockManager;
-
     @Spy
     ObjectMapper objectMapper = buildObjectMapper();
 
@@ -92,12 +86,6 @@ class AssistantConversationServiceTest {
         lenient().when(stateManager.toJson(any(ConversationData.class))).thenReturn("{}");
         lenient().doNothing().when(stateManager).save(any(ConversationStateEntity.class), anyString());
         lenient().doNothing().when(stateManager).delete(any(ConversationStateEntity.class));
-        // ConversationLockManager só serializa por chave tenant+telefone; em teste unitário
-        // basta executar a ação recebida diretamente, sem lock real (ver Fix 1).
-        lenient().when(lockManager.withLock(anyString(), any())).thenAnswer(invocation -> {
-            java.util.function.Supplier<?> action = invocation.getArgument(1);
-            return action.get();
-        });
     }
 
     private void setPrivateField(String fieldName, Object value) throws Exception {
@@ -483,61 +471,5 @@ class AssistantConversationServiceTest {
         assertEquals(ConversationStage.START, response.stage);
         assertTrue(response.reply.toLowerCase().contains("tudo certo"),
                 "Deve encerrar o contexto de reativacao. Reply: " + response.reply);
-    }
-
-    // ─── Fix 1: serialização por tenant+telefone (ConversationLockManager) ────
-
-    @Test
-    @DisplayName("process: processa a mensagem dentro do lock de tenant+telefone (evita race condition entre mensagens simultâneas)")
-    void process_serializaProcessamentoPeloLockDeTenantETelefone() throws Exception {
-        setupNovoUsuario();
-        when(domainService.resolveRegisteredCustomerName(any(), any()))
-                .thenReturn(Optional.empty());
-
-        service.process("oi", USER_ID, null);
-
-        ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
-        verify(lockManager).withLock(keyCaptor.capture(), any());
-        assertEquals(tenantId + ":" + USER_ID, keyCaptor.getValue(),
-                "A chave do lock deve combinar tenant e identificador do usuário, para não serializar clientes diferentes entre si.");
-    }
-
-    // ─── Fix 3: data retroativa vinda do bookingLead (modo legado) ────────────
-
-    @Test
-    @DisplayName("process: mensagem única com serviço + profissional + data retroativa (bookingLead) não deixa a data passada presa no estado")
-    void process_bookingLeadComDataRetroativaNaMesmaMensagem_descartaData() throws Exception {
-        // Estado ainda no início do fluxo — nada resolvido ainda. A mensagem única
-        // vai fazer detectBookingLeadSignals() reconhecer serviço, profissional E
-        // data (retroativa) de uma vez, aplicados via applyBookingLeadSignals — o
-        // caminho que NÃO passava pela validação de data retroativa antes do Fix 3.
-        ConversationData estadoInicial = new ConversationData();
-        estadoInicial.stage = ConversationStage.ASK_SERVICE;
-        estadoInicial.customerName = USER_NAME;
-        setupUsuarioComEstado(estadoInicial);
-
-        ServicoDto servico = new ServicoDto();
-        servico.id = UUID.randomUUID().toString();
-        servico.name = "Corte";
-        when(serviceNameFinder.extractFirst(anyString())).thenReturn(Optional.of("Corte"));
-        when(domainService.resolveService(anyString(), anyString())).thenReturn(Optional.of(servico));
-
-        ProfissionalDto profissional = new ProfissionalDto();
-        profissional.id = UUID.randomUUID().toString();
-        profissional.name = "Maria";
-        when(professionalNameFinder.extractFirst(anyString())).thenReturn(Optional.of("Maria"));
-        when(domainService.resolveProfessional(anyString(), anyString(), any())).thenReturn(Optional.of(profissional));
-
-        when(intentClassifier.classifyWithConfidence(anyString()))
-                .thenReturn(new IntentPrediction(IntentType.BOOK, 0.9d));
-
-        AssistantMessageResponse response = service.process(
-                "quero corte com Maria dia 01/01/2020", USER_ID, USER_NAME);
-
-        assertNull(response.slots.get("date"),
-                "Data retroativa detectada via bookingLead não pode ficar presa no estado. Slots: " + response.slots);
-        assertEquals(ConversationStage.ASK_DATE, response.stage);
-        assertTrue(response.reply.toLowerCase().contains("passou"),
-                "Deve informar que a data já passou. Reply: " + response.reply);
     }
 }

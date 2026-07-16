@@ -51,7 +51,6 @@ class AssistantConversationServiceCostControlUnitTest {
   @Mock ContextoTenant contextoTenant;
   @Mock AgentSystemPromptBuilder agentSystemPromptBuilder;
   @Mock LlmBookingAgent llmBookingAgent;
-  @Mock ConversationLockManager lockManager;
 
   @InjectMocks
   AssistantConversationService service;
@@ -83,12 +82,6 @@ class AssistantConversationServiceCostControlUnitTest {
     when(stateManager.parseState("{}")).thenReturn(new ConversationData());
     lenient().when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
         .thenReturn(new LlmBookingAgent.AgentResult("Oi", List.of(), "GROQ"));
-    // ConversationLockManager só serializa por chave tenant+telefone; em teste unitário
-    // basta executar a ação recebida diretamente, sem lock real (ver Fix 1).
-    lenient().when(lockManager.withLock(anyString(), any())).thenAnswer(invocation -> {
-      java.util.function.Supplier<?> action = invocation.getArgument(1);
-      return action.get();
-    });
   }
 
   @Test
