@@ -2743,6 +2743,34 @@ public class AssistantConversationService {
       }
     }
 
+    // ── Rede de seguranca deterministica contra loop de confirmacao ─────────────
+    // O LLM pode perguntar "confirma?" como TEXTO LIVRE, sem promover o estagio para
+    // CONFIRMATION nem emitir [CRIAR_AGENDAMENTO]. Quando isso acontece e o cliente
+    // afirma, o fluxo dependia de o LLM finalmente emitir o token — o modelo falha de
+    // forma intermitente e o cliente fica preso respondendo "sim" enquanto o bot
+    // repergunta "confirma?" indefinidamente. Aqui o backend assume o controle:
+    if (data.stage != ConversationStage.CONFIRMATION
+        && isConfirmationPending(data.chatHistory)
+        && isAffirmativeResponse(rawMessage)) {
+      if (coreSlotsReady && data.time != null) {
+        // Tudo resolvido → cria no backend, sem depender do token do LLM.
+        LOG.infof("[Agent] Confirmacao pendente + afirmacao com slots completos fora do estagio "
+            + "CONFIRMATION — criando agendamento deterministicamente (anti-loop)");
+        LlmBookingAgent.AgentAction synthetic =
+            new LlmBookingAgent.AgentAction("CRIAR_AGENDAMENTO", java.util.Map.of());
+        String toolResult = executeCriarAgendamento(synthetic, data, userIdentifier, tenantId);
+        return buildDeterministicBookingConfirmationReply(data, toolResult);
+      }
+      // O LLM pediu confirmacao mas falta um slot central (ex.: profissional nao
+      // resolveu para um id) — nao ha o que confirmar. Em vez de reoferecer "confirma?",
+      // pergunta deterministicamente o dado que falta (data.stage ja foi re-sincronizado
+      // por syncBookingStageFromKnownSlots antes deste ponto).
+      LOG.warnf("[Agent] Confirmacao pendente + afirmacao, mas slots incompletos "
+          + "(serviceId=%s professionalId=%s date=%s time=%s) — pedindo o dado que falta (anti-loop)",
+          data.serviceId, data.professionalId, data.date, data.time);
+      return promptForSyncedStage(data, tenantId);
+    }
+
     return null;
   }
 

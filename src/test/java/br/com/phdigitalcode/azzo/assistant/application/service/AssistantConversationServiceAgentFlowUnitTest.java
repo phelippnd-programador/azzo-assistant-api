@@ -12,6 +12,7 @@ import br.com.phdigitalcode.azzo.assistant.extractor.ServiceNameFinder;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.tenant.ContextoTenant;
 import br.com.phdigitalcode.azzo.assistant.llm.AgentSystemPromptBuilder;
 import br.com.phdigitalcode.azzo.assistant.llm.LlmBookingAgent;
+import br.com.phdigitalcode.azzo.assistant.llm.OllamaIntentService;
 import br.com.phdigitalcode.azzo.assistant.model.AssistantMessageResponse;
 import br.com.phdigitalcode.azzo.assistant.model.IntentPrediction;
 import br.com.phdigitalcode.azzo.assistant.model.IntentType;
@@ -58,6 +59,7 @@ class AssistantConversationServiceAgentFlowUnitTest {
     @Mock ContextoTenant contextoTenant;
     @Mock AgentSystemPromptBuilder agentSystemPromptBuilder;
     @Mock LlmBookingAgent llmBookingAgent;
+    @Mock OllamaIntentService ollamaIntentService;
     @Mock ConversationLockManager lockManager;
 
     @Spy
@@ -317,5 +319,76 @@ class AssistantConversationServiceAgentFlowUnitTest {
                         || response.reply.toLowerCase().contains("serviço desejado"),
                 "A paráfrase que re-pergunta um serviço já conhecido não deveria chegar ao cliente. Reply: " + response.reply);
         assertFalse(response.reply.isBlank(), "Deve haver uma resposta determinística substituta. Reply: " + response.reply);
+    }
+
+    // ─── Anti-loop de confirmação (confirma? em texto livre do LLM) ──────────────
+
+    @Test
+    @DisplayName("Anti-loop: LLM perguntou 'confirma?' como texto livre (stage != CONFIRMATION) e cliente afirma com todos os slots resolvidos → cria deterministicamente, sem depender do token do LLM")
+    void confirmacaoPendenteForaDoEstagio_comSlotsCompletos_criaDeterministicamente() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte";
+        estado.professionalId = professionalId;
+        estado.professionalName = "Phelipp";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.time = "17:00";
+        estado.preferredPeriod = TimePeriod.AFTERNOON;
+        // stage NUNCA foi promovido para CONFIRMATION — o "confirma?" veio do texto livre do LLM.
+        estado.stage = ConversationStage.ASK_TIME;
+        estado.chatHistory.add(new ChatMessage("assistant", "O serviço está disponível às 17:00. Confirma?"));
+        setupUsuarioComEstado(estado);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+
+        UUID appointmentId = UUID.randomUUID();
+        when(domainService.isSlotAvailable(eq(tenantId.toString()), eq(professionalId), eq(estado.date), eq("17:00"), eq(serviceId)))
+                .thenReturn(true);
+        when(domainService.createPendingAppointment(eq(tenantId.toString()), eq(serviceId), eq(professionalId),
+                eq(estado.date), eq("17:00"), eq(USER_ID), eq(USER_NAME)))
+                .thenReturn(appointmentId);
+
+        AssistantMessageResponse response = service.process("sim", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        // O backend cria o agendamento por conta própria, sem esperar o token do LLM.
+        verify(domainService).createPendingAppointment(eq(tenantId.toString()), eq(serviceId), eq(professionalId),
+                eq(estado.date), eq("17:00"), eq(USER_ID), eq(USER_NAME));
+        verify(domainService).confirmAppointment(eq(tenantId.toString()), eq(appointmentId), eq(USER_ID));
+        // Determinístico — não gasta chamada ao LLM (era exatamente o loop que travava).
+        verify(llmBookingAgent, never()).chat(anyString(), anyList(), anyString(), any(), any());
+    }
+
+    @Test
+    @DisplayName("Anti-loop: LLM perguntou 'confirma?' mas falta o profissional (não resolveu) → pergunta o dado que falta deterministicamente, sem reoferecer confirmação nem chamar o LLM")
+    void confirmacaoPendente_comSlotCentralFaltando_perguntaOQueFaltaSemLoop() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte";
+        // professionalId NÃO resolveu — é o gatilho suspeito do caso real ("phelipp").
+        estado.professionalId = null;
+        estado.date = LocalDate.now().plusDays(1);
+        estado.stage = ConversationStage.ASK_TIME;
+        estado.chatHistory.add(new ChatMessage("assistant", "Tudo pronto, posso confirmar o agendamento. Confirma?"));
+        setupUsuarioComEstado(estado);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+        // buildProfessionalPrompt consulta os profissionais do serviço.
+        when(domainService.listProfessionalsByService(eq(tenantId.toString()), eq(serviceId)))
+                .thenReturn(List.of());
+
+        AssistantMessageResponse response = service.process("sim", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        assertEquals(ConversationStage.ASK_PROFESSIONAL, response.stage,
+                "Sem profissional resolvido, deve voltar a pedir o profissional em vez de reoferecer confirmação. Reply: " + response.reply);
+        assertFalse(response.reply.toLowerCase().contains("confirma"),
+                "Não pode continuar reoferecendo 'confirma?' quando não há o que confirmar. Reply: " + response.reply);
+        verify(domainService, never()).createPendingAppointment(anyString(), any(), any(), any(), anyString(), anyString(), any());
+        verify(llmBookingAgent, never()).chat(anyString(), anyList(), anyString(), any(), any());
     }
 }
