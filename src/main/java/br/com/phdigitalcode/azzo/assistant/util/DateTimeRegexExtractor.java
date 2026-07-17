@@ -1,9 +1,11 @@
 package br.com.phdigitalcode.azzo.assistant.util;
 
+import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.time.temporal.TemporalAdjusters;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -47,11 +49,25 @@ public final class DateTimeRegexExtractor {
     NUMBER_WORDS.put("doze", 12);
   }
 
+  // Chaves ja normalizadas (sem acento, minusculo — ver TextNormalizer).
+  private static final Map<String, DayOfWeek> WEEKDAYS = new LinkedHashMap<>();
+  static {
+    WEEKDAYS.put("segunda", DayOfWeek.MONDAY);
+    WEEKDAYS.put("terca", DayOfWeek.TUESDAY);
+    WEEKDAYS.put("quarta", DayOfWeek.WEDNESDAY);
+    WEEKDAYS.put("quinta", DayOfWeek.THURSDAY);
+    WEEKDAYS.put("sexta", DayOfWeek.FRIDAY);
+    WEEKDAYS.put("sabado", DayOfWeek.SATURDAY);
+    WEEKDAYS.put("domingo", DayOfWeek.SUNDAY);
+  }
+
   private DateTimeRegexExtractor() {}
 
   public static Optional<LocalDate> extractDate(String text) {
     String normalized = TextNormalizer.normalize(text);
     LocalDate today = LocalDate.now();
+    // "depois de amanha" antes de "amanha" — senao o contains("amanha") o captura como amanha.
+    if (normalized.contains("depois de amanha")) return Optional.of(today.plusDays(2));
     if (normalized.contains("hoje")) return Optional.of(today);
     if (normalized.contains("amanha")) return Optional.of(today.plusDays(1));
 
@@ -75,6 +91,35 @@ public final class DateTimeRegexExtractor {
       }
     }
 
+    Optional<LocalDate> weekday = extractWeekday(normalized, today);
+    if (weekday.isPresent()) return weekday;
+
+    return Optional.empty();
+  }
+
+  /**
+   * Resolve nome de dia da semana ("segunda", "segunda-feira", "terca"...) para a
+   * PROXIMA ocorrencia futura — mesma semantica de
+   * AssistantConversationService#resolveDayOfWeek (nunca hoje: se hoje e segunda e o
+   * cliente diz "segunda", retorna a proxima segunda). Sem isso, datas informadas por
+   * dia da semana nao eram capturadas deterministicamente (dependiam so do LLM).
+   */
+  private static Optional<LocalDate> extractWeekday(String normalized, LocalDate today) {
+    for (Map.Entry<String, DayOfWeek> entry : WEEKDAYS.entrySet()) {
+      Matcher matcher = Pattern.compile("\\b" + entry.getKey() + "\\b").matcher(normalized);
+      if (matcher.find()) {
+        // "segunda" tambem e ordinal ("segunda opcao", "segunda vez"): nesses casos nao
+        // e dia da semana. Os demais dias nao tem essa ambiguidade.
+        if ("segunda".equals(entry.getKey())) {
+          String after = normalized.substring(matcher.end()).stripLeading();
+          if (after.startsWith("opcao") || after.startsWith("opcoes")
+              || after.startsWith("vez") || after.startsWith("melhor") || after.startsWith("pior")) {
+            continue;
+          }
+        }
+        return Optional.of(today.plusDays(1).with(TemporalAdjusters.nextOrSame(entry.getValue())));
+      }
+    }
     return Optional.empty();
   }
 

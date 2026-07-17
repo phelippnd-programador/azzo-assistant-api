@@ -358,7 +358,7 @@ Para cancelar um agendamento existente:
                     .filter(content -> content != null && !content.isBlank())
                     .orElse(DEFAULT_BASE_INSTRUCTION);
         } catch (RuntimeException e) {
-            LOG.warnf("[AgentPrompt] Falha ao buscar instruÃ§Ã£o base no banco, usando fallback em memÃ³ria: %s",
+            LOG.warnf("[AgentPrompt] Falha ao buscar instrução base no banco, usando fallback em memória: %s",
                     e.getMessage());
             return DEFAULT_BASE_INSTRUCTION;
         }

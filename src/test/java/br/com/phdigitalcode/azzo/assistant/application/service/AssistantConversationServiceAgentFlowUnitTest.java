@@ -391,4 +391,39 @@ class AssistantConversationServiceAgentFlowUnitTest {
         verify(domainService, never()).createPendingAppointment(anyString(), any(), any(), any(), anyString(), anyString(), any());
         verify(llmBookingAgent, never()).chat(anyString(), anyList(), anyString(), any(), any());
     }
+
+    // ─── #5: vazamento de system prompt / narração interna ──────────────────────
+
+    @Test
+    @DisplayName("#5: resposta que vaza narração interna ('Cliente pediu...') é descartada, não chega ao cliente")
+    void vazamentoDeNarracaoInterna_eDescartado() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte";
+        estado.professionalId = professionalId;
+        estado.professionalName = "Phelipp";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.time = "15:00";
+        estado.preferredPeriod = TimePeriod.AFTERNOON;
+        estado.stage = ConversationStage.ASK_TIME;
+        setupUsuarioComEstado(estado);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+        // Eco literal do system prompt (ver AgentSystemPromptBuilder: "CLIENTE PEDIU HORARIO...").
+        String vazamento = "Cliente pediu o horário na segunda-feira, mas não veio nenhum serviço listado. "
+                + "Vou verificar disponibilidade para 15:00.";
+        when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
+                .thenReturn(new LlmBookingAgent.AgentResult(vazamento, List.of(), "POOL"));
+
+        AssistantMessageResponse response = service.process("esta bem", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        String reply = response.reply.toLowerCase();
+        assertFalse(reply.contains("cliente pediu"),
+                "narração em 3a pessoa não pode chegar ao cliente. Reply: " + response.reply);
+        assertFalse(reply.contains("nenhum serviço listado") || reply.contains("nenhum servico listado"),
+                "eco de instrução do system prompt não pode vazar. Reply: " + response.reply);
+    }
 }
