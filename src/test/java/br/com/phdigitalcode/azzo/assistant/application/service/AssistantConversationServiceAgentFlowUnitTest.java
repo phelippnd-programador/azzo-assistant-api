@@ -426,4 +426,39 @@ class AssistantConversationServiceAgentFlowUnitTest {
         assertFalse(reply.contains("nenhum serviço listado") || reply.contains("nenhum servico listado"),
                 "eco de instrução do system prompt não pode vazar. Reply: " + response.reply);
     }
+
+    // ─── Confirmação ancorada ao serviço realmente resolvido (corte vs Teste) ───
+
+    @Test
+    @DisplayName("Confirmação do LLM que cita serviço diferente do resolvido é ancorada ao slot real (não confirma 'corte' quando o backend resolveu 'Teste')")
+    void confirmacaoDoLlm_ancoradaAoServicoResolvido() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Teste";              // serviço REALMENTE resolvido no backend
+        estado.professionalId = professionalId;
+        estado.professionalName = "Phelipp Damasceno";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.time = "15:00";
+        estado.preferredPeriod = TimePeriod.AFTERNOON;
+        estado.stage = ConversationStage.ASK_TIME; // LLM não promoveu para CONFIRMATION
+        setupUsuarioComEstado(estado);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+        // LLM confirma "corte" (eco do pedido do cliente), divergente do slot resolvido "Teste".
+        String confirmacaoLlm = "Confirmando agendamento para corte na segunda-feira às 15h com Phelipp Damasceno. Vamos confirmar?";
+        when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
+                .thenReturn(new LlmBookingAgent.AgentResult(confirmacaoLlm, List.of(), "POOL"));
+
+        AssistantMessageResponse response = service.process("pode ser", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        assertEquals(ConversationStage.CONFIRMATION, response.stage,
+                "deve promover para o estágio CONFIRMATION determinístico. Reply: " + response.reply);
+        assertTrue(response.reply.contains("Teste"),
+                "a confirmação deve refletir o serviço realmente resolvido. Reply: " + response.reply);
+        assertFalse(response.reply.toLowerCase().contains("corte"),
+                "não pode confirmar um serviço diferente do resolvido. Reply: " + response.reply);
+    }
 }
