@@ -2621,6 +2621,25 @@ public class AssistantConversationService {
     if (reply == null || reply.isBlank() || data == null) return reply;
     String normalized = TextNormalizer.normalize(reply);
 
+    // Vazamento de system prompt / narração interna: o assistente fala COM o cliente
+    // (2a pessoa, "você"), nunca SOBRE ele em 3a pessoa. Frases como "cliente pediu...",
+    // "o cliente", "nao veio nenhum servico listado" ou marcadores "[sistema" são eco das
+    // instruções do system prompt (ver AgentSystemPromptBuilder) escapando para o cliente.
+    // Substitui deterministicamente pelo próximo passo real, em vez de vazar o interno.
+    boolean leaksInternalNarration =
+        normalized.startsWith("cliente ")
+            || normalized.contains("cliente pediu")
+            || normalized.contains("o cliente ")
+            || normalized.contains("o usuario")
+            || normalized.contains("usuario pediu")
+            || normalized.contains("nao veio nenhum servico")
+            || normalized.contains("[sistema");
+    if (leaksInternalNarration) {
+      LOG.warnf("[Agent] Vazamento de narracao interna/system prompt descartado — "
+          + "reply original='%s'", reply.length() > 120 ? reply.substring(0, 120) + "..." : reply);
+      return promptForSyncedStage(data, tenantId);
+    }
+
     boolean claimsUnknownProfessionalOrDate =
         normalized.contains("nao consegui identificar o profissional")
             || normalized.contains("nao consegui identificar a data")
