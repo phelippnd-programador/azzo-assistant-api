@@ -335,6 +335,9 @@ public class AssistantConversationService {
     // já é conhecido. A causa raiz da contradição foi corrigida acima; isto é uma
     // rede de segurança adicional, agnóstica a qual LLM do pool respondeu.
     finalReply = sanitizeReplyAgainstKnownState(data, finalReply, tenantId);
+    // Ancora a confirmação nos slots REALMENTE resolvidos (backend é fonte de verdade):
+    // impede que o LLM confirme um serviço diferente do que sera agendado.
+    finalReply = anchorConfirmationToResolvedSlots(data, finalReply);
 
     // Grava no histórico para próximos turnos (usa mensagem enriquecida para consistência)
     data.chatHistory.add(new ChatMessage("user", compactedMessage));
@@ -2699,6 +2702,36 @@ public class AssistantConversationService {
     // Nega conhecer um slot enquanto os slots operacionais centrais já estão preenchidos.
     return (serviceFilled || professionalFilled || dateFilled)
         && CLAIM_UNKNOWN_SLOT.matcher(normalized).find();
+  }
+
+  /**
+   * Backend como fonte de verdade na confirmação: se o LLM montou uma pergunta de
+   * confirmação em texto livre (sem promover o estágio para CONFIRMATION), com todos os
+   * slots já resolvidos, substitui pela pergunta determinística — que reflete os SLOTS
+   * REALMENTE RESOLVIDOS (data.serviceName etc.), nunca a paráfrase do LLM.
+   *
+   * <p>Sem isto, o LLM podia confirmar um serviço ("corte") diferente do que o backend
+   * resolveu ("Teste") e o cliente confirmava às cegas algo diferente do que seria
+   * agendado. Ancorar também deixa o próximo "sim" cair no fluxo determinístico
+   * (stage=CONFIRMATION), em vez de depender do LLM.
+   */
+  private String anchorConfirmationToResolvedSlots(ConversationData data, String reply) {
+    if (reply == null || reply.isBlank() || data == null) return reply;
+    if (data.stage == ConversationStage.CONFIRMATION) return reply; // já é a determinística
+    boolean coreSlotsReady = data.serviceId != null && data.professionalId != null
+        && data.date != null && data.time != null && !data.time.isBlank();
+    if (!coreSlotsReady) return reply;
+
+    String normalized = TextNormalizer.normalize(reply);
+    boolean looksLikeConfirmationQuestion = reply.contains("?")
+        && (normalized.contains("confirma") || normalized.contains("confirmar")
+            || normalized.contains("confirmando"));
+    if (!looksLikeConfirmationQuestion) return reply;
+
+    LOG.infof("[Agent] Confirmacao do LLM ancorada aos slots resolvidos (servico=%s prof=%s data=%s hora=%s) "
+        + "— evita divergencia confirmacao-vs-agendamento", data.serviceName, data.professionalName, data.date, data.time);
+    data.stage = ConversationStage.CONFIRMATION;
+    return buildBookingConfirmationQuestion(data);
   }
 
   private String preferredPeriodLabel(ConversationData data) {
