@@ -2829,13 +2829,13 @@ public class AssistantConversationService {
     }
     if (intent == IntentType.CANCEL) {
       if (!domainService.canCancelViaWhatsApp(tenantId)) {
-        return "Esse salÃ£o nÃ£o permite cancelamentos pelo WhatsApp agora. ðŸ˜•";
+        return "Esse salão não permite cancelamentos pelo WhatsApp agora. 😕";
       }
       return iniciarFluxoCancelamento(data, userIdentifier, tenantId);
     }
     if (intent == IntentType.RESCHEDULE) {
       if (!domainService.canRescheduleViaWhatsApp(tenantId)) {
-        return "Esse salÃ£o nÃ£o permite remarcaÃ§Ãµes pelo WhatsApp agora. ðŸ˜•";
+        return "Esse salão não permite remarcações pelo WhatsApp agora. 😕";
       }
       return iniciarFluxoRemarcacao(data, userIdentifier, tenantId);
     }

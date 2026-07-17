@@ -5,7 +5,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.DayOfWeek;
 import java.time.LocalDate;
+import java.time.temporal.TemporalAdjusters;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -92,6 +94,53 @@ class DateTimeRegexExtractorTest {
         // TextNormalizer.normalize(null) retorna "" então não há crash
         Optional<LocalDate> result = DateTimeRegexExtractor.extractDate(null);
         assertTrue(result.isEmpty());
+    }
+
+    // ─── extractDate: dia da semana (bug do fluxo WhatsApp) ─────────────────────
+
+    @Test
+    @DisplayName("'segunda' resolve para a próxima segunda futura (nunca hoje)")
+    void extractDate_diaDaSemana_segunda() {
+        Optional<LocalDate> result = DateTimeRegexExtractor.extractDate("quero na segunda");
+        assertTrue(result.isPresent());
+        LocalDate esperado = LocalDate.now().plusDays(1)
+                .with(TemporalAdjusters.nextOrSame(DayOfWeek.MONDAY));
+        assertEquals(esperado, result.get());
+        assertEquals(DayOfWeek.MONDAY, result.get().getDayOfWeek());
+        assertTrue(result.get().isAfter(LocalDate.now()), "dia da semana deve sempre cair no futuro");
+    }
+
+    @Test
+    @DisplayName("'segunda-feira' com sufixo e horário junto também resolve o dia")
+    void extractDate_diaDaSemana_comSufixo() {
+        Optional<LocalDate> result = DateTimeRegexExtractor.extractDate("pode ser segunda-feira as 15h");
+        assertTrue(result.isPresent());
+        assertEquals(DayOfWeek.MONDAY, result.get().getDayOfWeek());
+        assertTrue(result.get().isAfter(LocalDate.now()));
+    }
+
+    @Test
+    @DisplayName("'terça' (com acento) resolve para a próxima terça futura")
+    void extractDate_diaDaSemana_terca() {
+        Optional<LocalDate> result = DateTimeRegexExtractor.extractDate("marca pra terça");
+        assertTrue(result.isPresent());
+        assertEquals(DayOfWeek.TUESDAY, result.get().getDayOfWeek());
+        assertTrue(result.get().isAfter(LocalDate.now()));
+    }
+
+    @Test
+    @DisplayName("'segunda opção' (ordinal) NÃO é interpretado como dia da semana")
+    void extractDate_segundaOrdinal_naoEData() {
+        Optional<LocalDate> result = DateTimeRegexExtractor.extractDate("quero a segunda opção");
+        assertTrue(result.isEmpty(), "ordinal não deve virar data. Resultado: " + result);
+    }
+
+    @Test
+    @DisplayName("'depois de amanhã' retorna hoje+2 (não é capturado como 'amanhã')")
+    void extractDate_depoisDeAmanha() {
+        Optional<LocalDate> result = DateTimeRegexExtractor.extractDate("depois de amanhã");
+        assertTrue(result.isPresent());
+        assertEquals(LocalDate.now().plusDays(2), result.get());
     }
 
     // ─── extractTime ──────────────────────────────────────────────────────────
