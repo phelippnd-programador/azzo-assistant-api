@@ -72,6 +72,11 @@ class AssistantBookingFlowIntegrationTest {
     ObjectMapper objectMapper = buildObjectMapper();
 
     @InjectMocks
+    AgentMessageHandler agentHandler;
+    @InjectMocks
+    LegacyMessageHandler legacyHandler;
+
+    @InjectMocks
     AssistantConversationService service;
 
     // ─── constantes ────────────────────────────────────────────────────────────
@@ -93,6 +98,8 @@ class AssistantBookingFlowIntegrationTest {
     @BeforeEach
     void setUp() throws Exception {
         tenantId = UUID.randomUUID();
+        service.agentHandler = agentHandler;
+        service.legacyHandler = legacyHandler;
         setField("ttlMinutes",         120L);
         setField("greetingZone",       "America/Sao_Paulo");
         setField("minIntentConfidence", 0.62d);
@@ -100,9 +107,22 @@ class AssistantBookingFlowIntegrationTest {
     }
 
     private void setField(String name, Object value) throws Exception {
-        Field f = AssistantConversationService.class.getDeclaredField(name);
-        f.setAccessible(true);
-        f.set(service, value);
+        boolean set = false;
+        for (Object target : new Object[] {service, agentHandler, legacyHandler}) {
+            Class<?> c = target.getClass();
+            while (c != null) {
+                try {
+                    Field f = c.getDeclaredField(name);
+                    f.setAccessible(true);
+                    f.set(target, value);
+                    set = true;
+                    break;
+                } catch (NoSuchFieldException e) {
+                    c = c.getSuperclass();
+                }
+            }
+        }
+        if (!set) throw new NoSuchFieldException(name);
     }
 
     // ─── helpers ───────────────────────────────────────────────────────────────
