@@ -66,6 +66,11 @@ class AssistantConversationServiceAgentFlowUnitTest {
     ObjectMapper objectMapper = buildObjectMapper();
 
     @InjectMocks
+    AgentMessageHandler agentHandler;
+    @InjectMocks
+    LegacyMessageHandler legacyHandler;
+
+    @InjectMocks
     AssistantConversationService service;
 
     private static final String USER_ID = "+5511999990001";
@@ -86,6 +91,8 @@ class AssistantConversationServiceAgentFlowUnitTest {
         tenantId = UUID.randomUUID();
         professionalId = UUID.randomUUID();
         serviceId = UUID.randomUUID();
+        service.agentHandler = agentHandler;
+        service.legacyHandler = legacyHandler;
         setPrivateField("ttlMinutes", 120L);
         setPrivateField("greetingZone", "America/Sao_Paulo");
         setPrivateField("minIntentConfidence", 0.62d);
@@ -109,9 +116,22 @@ class AssistantConversationServiceAgentFlowUnitTest {
     }
 
     private void setPrivateField(String fieldName, Object value) throws Exception {
-        Field field = AssistantConversationService.class.getDeclaredField(fieldName);
-        field.setAccessible(true);
-        field.set(service, value);
+        boolean set = false;
+        for (Object target : new Object[] {service, agentHandler, legacyHandler}) {
+            Class<?> c = target.getClass();
+            while (c != null) {
+                try {
+                    Field field = c.getDeclaredField(fieldName);
+                    field.setAccessible(true);
+                    field.set(target, value);
+                    set = true;
+                    break;
+                } catch (NoSuchFieldException e) {
+                    c = c.getSuperclass();
+                }
+            }
+        }
+        if (!set) throw new NoSuchFieldException(fieldName);
     }
 
     private ConversationStateEntity entityComEstado(ConversationData data) throws Exception {

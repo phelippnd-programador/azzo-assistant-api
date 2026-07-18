@@ -58,6 +58,12 @@ class AssistantConversationServiceCostControlUnitTest {
   // declará-lo o @InjectMocks o deixava null → NPE. Default do Mockito p/ Optional é empty.
   @Mock OllamaIntentService ollamaIntentService;
 
+  // Os handlers recebem os mesmos mocks via @InjectMocks; depois são plugados no service.
+  @InjectMocks
+  AgentMessageHandler agentHandler;
+  @InjectMocks
+  LegacyMessageHandler legacyHandler;
+
   @InjectMocks
   AssistantConversationService service;
 
@@ -65,13 +71,19 @@ class AssistantConversationServiceCostControlUnitTest {
 
   @BeforeEach
   void setUp() throws Exception {
-    setPrivateField("agentEnabled", true);
-    setPrivateField("ttlMinutes", 120L);
-    setPrivateField("maxHistoryMessages", 80);
-    setPrivateField("keepHistoryMessages", 60);
-    setPrivateField("maxHistoryChars", 3000);
-    setPrivateField("llmMaxInputChars", 160);
-    setPrivateField("shortResponseMaxTokens", 48);
+    // Flags de infraestrutura ficam no service; parâmetros de conversa/LLM migraram para
+    // AbstractMessageHandler (base dos handlers).
+    setField(service, "agentEnabled", true);
+    setField(service, "ttlMinutes", 120L);
+    setField(service, "agentHandler", agentHandler);
+    setField(service, "legacyHandler", legacyHandler);
+    for (Object handler : new Object[] {agentHandler, legacyHandler}) {
+      setField(handler, "maxHistoryMessages", 80);
+      setField(handler, "keepHistoryMessages", 60);
+      setField(handler, "maxHistoryChars", 3000);
+      setField(handler, "llmMaxInputChars", 160);
+      setField(handler, "shortResponseMaxTokens", 48);
+    }
 
     UUID tenantId = UUID.randomUUID();
     when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
@@ -198,8 +210,8 @@ class AssistantConversationServiceCostControlUnitTest {
   }
 
   @Test
-  void devePrecarregarHorariosReaisNoContextoDaPrimeiraChamadaAoLlm() {
-    service.llmMaxInputChars = 3000;
+  void devePrecarregarHorariosReaisNoContextoDaPrimeiraChamadaAoLlm() throws Exception {
+    setField(agentHandler, "llmMaxInputChars", 3000);
     ConversationData data = new ConversationData();
     data.stage = ConversationStage.ASK_TIME;
     data.customerName = "Phelipp";
@@ -239,9 +251,18 @@ class AssistantConversationServiceCostControlUnitTest {
     org.mockito.Mockito.verifyNoInteractions(llmBookingAgent);
   }
 
-  private void setPrivateField(String fieldName, Object value) throws Exception {
-    Field field = AssistantConversationService.class.getDeclaredField(fieldName);
-    field.setAccessible(true);
-    field.set(service, value);
+  private static void setField(Object target, String fieldName, Object value) throws Exception {
+    Class<?> c = target.getClass();
+    while (c != null) {
+      try {
+        Field field = c.getDeclaredField(fieldName);
+        field.setAccessible(true);
+        field.set(target, value);
+        return;
+      } catch (NoSuchFieldException e) {
+        c = c.getSuperclass();
+      }
+    }
+    throw new NoSuchFieldException(fieldName);
   }
 }
