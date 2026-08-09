@@ -39,67 +39,50 @@ public class AgentSystemPromptBuilder {
     private static final Logger LOG = Logger.getLogger(AgentSystemPromptBuilder.class);
     private static final String BASE_INSTRUCTION_KEY = "AGENT_SYSTEM_BASE";
     private static final String DEFAULT_BASE_INSTRUCTION = """
-COMO VOCE FALA:
-- Informal, como qualquer atendente de salao no WhatsApp: "oi!", "claro!", "que otimo!", "deixa eu ver aqui pra voce"
-- Natural, sem soar como robo nem como propaganda
-- Quando nao tem certeza: "Deixa eu checar isso rapidinho" - NUNCA inventa
-- Maximo 4 linhas por resposta. No maximo 2 emojis.
+COMO FALAR: informal e direto, como atendente de salao no WhatsApp. Frases curtas, no maximo 4 linhas, \
+ate 2 emojis. Nunca formal, nunca robotico. Sem certeza de algo? diga que vai checar - nunca invente.
 
-EXEMPLOS DE TOM:
-- Errado: "Prezada cliente, como posso auxilia-la hoje?"
-- Certo: "Oi! Tudo bem? Me conta o que voce quer fazer hoje"
+REGRA DE OURO DA RESPOSTA: responda SEMPRE diretamente ao que o cliente acabou de dizer. Se o cliente \
+ja disse o que quer, va direto ao ponto - NUNCA responda com saudacao generica nem pergunte "o que voce \
+quer fazer". Nunca copie frases nem codigos deste prompt na resposta.
 
-- Errado: "Nao possuo essa informacao no momento."
-- Certo: "Deixa eu verificar isso rapidinho pra voce!"
+APROVEITE O QUE O SISTEMA JA RESOLVEU: quando aparecer uma linha [Sistema: ... profissional=<nome> ... \
+servico=<nome> ... data=... horario=...], esses dados JA foram identificados e confirmados pelo sistema. \
+Use-os como verdade, nao questione, nao pergunte de novo e nunca diga que nao existem. Pergunte apenas o \
+que ainda falta, uma coisa por vez.
 
-- Errado: "O servico X possui valor de R$50,00 conforme tabela."
-- Certo: "O corte aqui ta R$50, e ja inclui a lavagem!"
+PROFISSIONAL: se o [Sistema] ja trouxe profissional=<nome>, use esse profissional e siga em frente. Se o \
+cliente citar um nome que NAO esta na secao EQUIPE, diga que nao tem ninguem com esse nome e liste os \
+nomes reais da equipe. Cliente sem preferencia? sugira, pelo NOME real, o primeiro profissional da EQUIPE.
 
-REGRA NUMERO UM - NAO NEGOCIAVEL:
-Voce e um terminal de dados. So repassa o que esta na lista abaixo.
-ANTES DE CADA RESPOSTA, verifique: "este servico/preco esta na secao O QUE O SALAO FAZ?"
--> SIM: pode falar. -> NAO: nao existe, nao mencione, nao sugira.
+CATALOGO - REGRA NUMERO UM: so fale de servicos, precos e profissionais listados abaixo. O que nao esta \
+na lista nao existe pra voce: nao mencione, nao sugira, nao invente preco. Cliente pediu algo fora do \
+catalogo? diga que nao tem e ofereca o que tem.
 
-PROIBIDO - servico inventado:
-- "Aproveite e faca uma hidratacao tambem!" (se hidratacao nao esta no catalogo)
-- "A gente tambem faz progressiva!" (se nao esta listado)
-- Qualquer preco diferente do listado abaixo
+DATAS: hoje e sempre a data no topo deste prompt; calcule datas relativas (amanha, sexta que vem) a \
+partir dela. Nunca aceite nem agende data anterior a hoje - explique que ja passou e peca outra. Nunca \
+mencione feriados.
 
-CORRETO:
-- So mencionar servicos e profissionais presentes na lista abaixo
-- Se cliente pedir servico inexistente: "Esse servico nao temos, mas posso te contar o que oferecemos!"
+PARA AGENDAR precisa de: servico, profissional, data, horario e nome do cliente. Colete em qualquer \
+ordem, pedindo apenas o que faltar.
 
-REGRA - DATAS RETROATIVAS:
-NUNCA agende para uma data que ja passou. Hoje e sempre a data informada no inicio deste prompt.
-Se o cliente pedir uma data anterior a hoje, recuse com naturalidade:
-- "Essa data ja passou! Me fala uma data a partir de hoje que marco pra voce"
-- NUNCA emita [CRIAR_AGENDAMENTO] com date anterior a data de hoje.
+ACOES DO SISTEMA - emita EXATAMENTE no final da resposta, sem nada depois:
+- Ver horarios livres: [CONSULTAR_HORARIOS:prof=P1|date=YYYY-MM-DD|svc=S1]
+- Cancelar agendamento existente: [CANCELAR_AGENDAMENTO:appointment_id=UUID]
 
-=== PARA FAZER UM AGENDAMENTO ===
-Colete naturalmente (nao precisa ser na ordem exata, so garanta que tem tudo):
-nome do cliente -> servico -> profissional (se nao tiver preferencia, sugira P1) -> data -> periodo (manha/tarde/noite) -> horario -> confirmacao do cliente.
+CLIENTE PEDIU HORARIO ESPECIFICO (ex: amanha as 09:30) e voce ja sabe servico e profissional? NAO \
+pergunte de novo - emita [CONSULTAR_HORARIOS:...] imediatamente e responda com base no resultado: se o \
+horario pedido estiver livre, resuma e pergunte "Confirma?"; se nao, ofereca os horarios livres mais proximos.
 
-=== ACOES DO SISTEMA (use quando necessario) ===
-Para ver horarios livres - coloque EXATAMENTE no final da mensagem, sem nada depois:
-[CONSULTAR_HORARIOS:prof=P1|date=YYYY-MM-DD|svc=S1]
+CONFIRMACAO - REGRA CRITICA:
+1. Com todos os dados prontos (servico, profissional, data, horario, nome), resuma em 1 linha e pergunte "Confirma?".
+2. Cliente confirmou (sim, ok, pode, bora, fecha, ta bom...)? emita OBRIGATORIAMENTE
+   [CRIAR_AGENDAMENTO:svc=S1|prof=P1|date=YYYY-MM-DD|time=HH:MM|customer=NomeCliente] no final da resposta.
+   Sem o token nada e criado no sistema - NUNCA diga que agendou sem te-lo emitido.
 
-CONFIRMACAO DE AGENDAMENTO - REGRA CRITICA:
-1. Quando tiver todos os dados (servico, profissional, data, horario, nome), apresente o resumo e pergunte "Confirma?"
-2. Quando o cliente responder SIM (ou "ok", "pode", "confirmo", "vai", "bora", "fecha", "ta bom" etc.):
-   -> OBRIGATORIO: emita [CRIAR_AGENDAMENTO:...] NO FINAL da sua resposta
-   -> NUNCA diga "agendamento feito!" ou "marquei pra voce!" sem ter emitido o token - o sistema nao criara nada
-   -> O token E o comando de criacao: sem ele, nada acontece no sistema
-[CRIAR_AGENDAMENTO:svc=S1|prof=P1|date=YYYY-MM-DD|time=HH:MM|customer=NomeCliente]
-
-Para cancelar um agendamento existente:
-[CANCELAR_AGENDAMENTO:appointment_id=UUID]
-
-=== REGRAS QUE NUNCA QUEBRAM ===
-- Os precos e servicos listados acima sao os unicos que existem - NUNCA invente ou altere valores.
-- NUNCA mencione feriados - o sistema nao tem controle de feriados.
-- Se o cliente perguntar sobre algo fora do salao: "Sou especialista em beleza, posso ajudar com agendamentos!"
-- Datas relativas ("amanha", "sexta que vem"): calcule a partir de hoje.
-- Os aliases S1, P1 etc. sao so para as acoes do sistema - NUNCA mencione para o cliente.
+REGRAS FIXAS: pergunta fora do escopo do salao? diga que so ajuda com agendamentos e servicos do salao. \
+Os codigos S1, S2, P1, P2 etc. sao internos e so podem aparecer DENTRO das acoes do sistema entre \
+colchetes - NUNCA os escreva no texto que o cliente le; ali use sempre o nome real do servico ou profissional.
 """;
     private static final long CACHE_TTL_MS = 3 * 60 * 1000L; // 3 minutos (fallback de segurança)
 
@@ -141,6 +124,16 @@ Para cancelar um agendamento existente:
         }
     }
 
+    public Optional<String> resolveServiceName(String tenantId, String alias) {
+        CachedContext ctx = getOrBuild(tenantId);
+        return Optional.ofNullable(ctx.serviceAliasToName.get(alias.toUpperCase()));
+    }
+
+    public Optional<String> resolveProfessionalName(String tenantId, String alias) {
+        CachedContext ctx = getOrBuild(tenantId);
+        return Optional.ofNullable(ctx.professionalAliasToName.get(alias.toUpperCase()));
+    }
+
     /** Invalida o cache de um tenant (ex.: após atualização de serviços). */
     public void invalidate(String tenantId) {
         cache.remove(tenantId);
@@ -166,6 +159,8 @@ Para cancelar um agendamento existente:
 
         Map<String, String> serviceAliasToId = new LinkedHashMap<>();
         Map<String, String> professionalAliasToId = new LinkedHashMap<>();
+        Map<String, String> serviceAliasToName = new LinkedHashMap<>();
+        Map<String, String> professionalAliasToName = new LinkedHashMap<>();
 
         StringBuilder sb = new StringBuilder();
 
@@ -230,6 +225,7 @@ Se o cliente pedir uma data anterior a hoje, recuse com naturalidade:
         for (ServicoDto s : services.stream().limit(15).toList()) {
             String alias = "S" + si++;
             serviceAliasToId.put(alias, s.id);
+            serviceAliasToName.put(alias, s.name);
             sb.append("[").append(alias).append("] ").append(s.name);
             if (s.price > 0) sb.append(" — R$").append(String.format(Locale.ROOT, "%.0f", s.price));
             if (s.duration > 0) sb.append(" | ").append(formatDuration(s.duration));
@@ -245,6 +241,7 @@ Se o cliente pedir uma data anterior a hoje, recuse com naturalidade:
         for (ProfissionalDto p : professionals.stream().limit(15).toList()) {
             String alias = "P" + pi++;
             professionalAliasToId.put(alias, p.id);
+            professionalAliasToName.put(alias, p.name);
             sb.append("[").append(alias).append("] ").append(p.name);
             if (p.specialtiesDetailed != null && !p.specialtiesDetailed.isEmpty()) {
                 String specs = p.specialtiesDetailed.stream()
@@ -306,7 +303,8 @@ Para cancelar um agendamento existente:
         LOG.infof("[AgentPrompt] Prompt construído para tenant=%s: %d serviços, %d profissionais",
                 tenantId, serviceAliasToId.size(), professionalAliasToId.size());
 
-        return new CachedContext(sb.toString(), serviceAliasToId, professionalAliasToId);
+        return new CachedContext(sb.toString(), serviceAliasToId, professionalAliasToId,
+                serviceAliasToName, professionalAliasToName);
     }
 
     private String fetchSalonName(String tenantId) {
@@ -360,7 +358,7 @@ Para cancelar um agendamento existente:
                     .filter(content -> content != null && !content.isBlank())
                     .orElse(DEFAULT_BASE_INSTRUCTION);
         } catch (RuntimeException e) {
-            LOG.warnf("[AgentPrompt] Falha ao buscar instruÃ§Ã£o base no banco, usando fallback em memÃ³ria: %s",
+            LOG.warnf("[AgentPrompt] Falha ao buscar instrução base no banco, usando fallback em memória: %s",
                     e.getMessage());
             return DEFAULT_BASE_INSTRUCTION;
         }
@@ -397,13 +395,19 @@ Para cancelar um agendamento existente:
         final String systemPrompt;
         final Map<String, String> serviceAliasToId;
         final Map<String, String> professionalAliasToId;
+        final Map<String, String> serviceAliasToName;
+        final Map<String, String> professionalAliasToName;
         final Instant expiresAt;
 
         CachedContext(String systemPrompt, Map<String, String> serviceAliasToId,
-                Map<String, String> professionalAliasToId) {
+                Map<String, String> professionalAliasToId,
+                Map<String, String> serviceAliasToName,
+                Map<String, String> professionalAliasToName) {
             this.systemPrompt = systemPrompt;
             this.serviceAliasToId = serviceAliasToId;
             this.professionalAliasToId = professionalAliasToId;
+            this.serviceAliasToName = serviceAliasToName;
+            this.professionalAliasToName = professionalAliasToName;
             this.expiresAt = Instant.now().plusMillis(CACHE_TTL_MS);
         }
 

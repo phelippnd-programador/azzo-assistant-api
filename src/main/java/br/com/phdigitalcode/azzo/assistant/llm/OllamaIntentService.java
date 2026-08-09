@@ -1,24 +1,25 @@
 package br.com.phdigitalcode.azzo.assistant.llm;
 
-import java.util.List;
 import java.util.Optional;
 
-import org.eclipse.microprofile.config.inject.ConfigProperty;
-import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmRequest;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmResponse;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.execution.LlmPoolExecutor;
 import br.com.phdigitalcode.azzo.assistant.model.IntentPrediction;
 import br.com.phdigitalcode.azzo.assistant.model.IntentType;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 /**
- * Classificador de intenção via Ollama LLM.
- * Usado como fallback quando o OpenNLP retorna baixa confiança.
- * Sempre retorna Optional.empty() em caso de erro — nunca lança exceção.
+ * Classificador de intenção via LLM (pool de provedores).
+ * Usado como fallback quando o OpenNLP (classificador local, não-LLM) retorna
+ * baixa confiança. Sempre retorna Optional.empty() em caso de erro/indisponibilidade
+ * do pool — nunca lança exceção.
  */
 @ApplicationScoped
 public class OllamaIntentService {
@@ -49,63 +50,50 @@ public class OllamaIntentService {
         """;
 
     @Inject
-    @RestClient
-    OllamaRestClient ollamaRestClient;
+    LlmPoolExecutor poolExecutor;
 
     @Inject
     ObjectMapper objectMapper;
 
-    @ConfigProperty(name = "assistant.ollama.enabled", defaultValue = "false")
-    boolean enabled;
-
-    @ConfigProperty(name = "assistant.ollama.model", defaultValue = "gemma2:2b")
-    String model;
-
     /**
-     * Classifica a intenção da mensagem usando Ollama.
+     * Classifica a intenção da mensagem usando o pool de provedores de LLM.
      *
      * @param message      mensagem bruta do usuário
      * @param currentStage estágio atual da conversa (contexto para o LLM)
-     * @return IntentPrediction se bem-sucedido, empty() caso contrário
+     * @return IntentPrediction se bem-sucedido, empty() caso contrário (sem provedor
+     *         elegível no pool ou falha na chamada)
      */
     public Optional<IntentPrediction> classify(String message, String currentStage) {
-        if (!enabled) {
-            LOG.debugf("Ollama desabilitado (assistant.ollama.enabled=false)");
-            return Optional.empty();
-        }
-
-        LOG.infof("[Ollama] Classificando intent para: '%s' (stage=%s, model=%s)", abbrev(message), currentStage, model);
+        LOG.infof("[LlmIntent] Classificando intent para: '%s' (stage=%s)", abbrev(message), currentStage);
         long start = System.currentTimeMillis();
         try {
-            OllamaChatRequest request = new OllamaChatRequest();
-            request.model = model;
-            request.stream = false;
-            request.format = "json";
-            request.options = new OllamaOptions(0.1, 60);
-            request.messages = List.of(
-                new OllamaMessage("system", SYSTEM_PROMPT + "\nEstágio atual: " + currentStage),
-                new OllamaMessage("user", message)
-            );
+            LlmRequest req = new LlmRequest();
+            req.systemPrompt = SYSTEM_PROMPT + "\nEstágio atual: " + currentStage;
+            req.mensagemAtual = message;
+            req.temperatura = 0.1;
+            req.maxTokens = 60;
+            req.jsonMode = true;
 
-            OllamaChatResponse response = ollamaRestClient.chat(request);
+            LlmResponse response = poolExecutor.executar(req);
             long elapsed = System.currentTimeMillis() - start;
 
-            if (response == null || response.message == null || response.message.content == null) {
-                LOG.warnf("[Ollama] Resposta vazia após %dms", elapsed);
+            if (response == null || response.erro() || response.vazia()) {
+                LOG.warnf("[LlmIntent] Pool sem resposta após %dms", elapsed);
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.message.content);
+            JsonNode node = objectMapper.readTree(response.texto());
             String intentStr = node.path("intent").asText("UNKNOWN");
             double confidence = node.path("confidence").asDouble(0.0);
             IntentType intentType = parseIntent(intentStr);
 
-            LOG.infof("[Ollama] Intent: %s conf=%.2f em %dms (raw='%s')", intentType, confidence, elapsed, response.message.content);
+            LOG.infof("[LlmIntent] Intent: %s conf=%.2f em %dms (raw='%s')",
+                intentType, confidence, elapsed, response.texto());
             return Optional.of(new IntentPrediction(intentType, confidence));
 
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - start;
-            LOG.warnf("[Ollama] Indisponível após %dms → fallback OpenNLP. Causa: %s", elapsed, e.getMessage());
+            LOG.warnf("[LlmIntent] Indisponível após %dms → fallback OpenNLP. Causa: %s", elapsed, e.getMessage());
             return Optional.empty();
         }
     }

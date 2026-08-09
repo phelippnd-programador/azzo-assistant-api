@@ -31,6 +31,7 @@ import br.com.phdigitalcode.azzo.assistant.extractor.ProfessionalNameFinder;
 import br.com.phdigitalcode.azzo.assistant.extractor.ServiceNameFinder;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.client.dto.ServicoDto;
 import br.com.phdigitalcode.azzo.assistant.infrastructure.tenant.ContextoTenant;
+import br.com.phdigitalcode.azzo.assistant.llm.OllamaIntentService;
 import br.com.phdigitalcode.azzo.assistant.llm.OllamaResponseService;
 import br.com.phdigitalcode.azzo.assistant.model.AssistantMessageResponse;
 import br.com.phdigitalcode.azzo.assistant.model.IntentPrediction;
@@ -47,6 +48,13 @@ class AssistantConversationReactivationUnitTest {
     @Mock AssistantDomainService domainService;
     @Mock ConversationStateManager stateManager;
     @Mock ContextoTenant contextoTenant;
+    @Mock ConversationLockManager lockManager;
+    @Mock OllamaIntentService ollamaIntentService;
+
+    @InjectMocks
+    AgentMessageHandler agentHandler;
+    @InjectMocks
+    LegacyMessageHandler legacyHandler;
 
     @InjectMocks
     AssistantConversationService service;
@@ -58,6 +66,8 @@ class AssistantConversationReactivationUnitTest {
     @BeforeEach
     void setUp() throws Exception {
         tenantId = UUID.randomUUID();
+        service.agentHandler = agentHandler;
+        service.legacyHandler = legacyHandler;
         setPrivateField("ttlMinutes", 120L);
         setPrivateField("greetingZone", "America/Sao_Paulo");
         setPrivateField("minIntentConfidence", 0.62d);
@@ -67,6 +77,12 @@ class AssistantConversationReactivationUnitTest {
         when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
         lenient().when(ollamaResponseService.generateHandoffSuggestion())
                 .thenReturn(Optional.of("Quer falar com uma atendente?"));
+        // ConversationLockManager só serializa por chave tenant+telefone; em teste unitário
+        // basta executar a ação recebida diretamente, sem lock real.
+        lenient().when(lockManager.withLock(anyString(), any())).thenAnswer(invocation -> {
+            java.util.function.Supplier<?> action = invocation.getArgument(1);
+            return action.get();
+        });
     }
 
     @Test
@@ -121,8 +137,10 @@ class AssistantConversationReactivationUnitTest {
                 .thenReturn(new IntentPrediction(IntentType.BOOK, 0.95d));
         when(serviceNameFinder.extractFirst(anyString())).thenReturn(Optional.of("corte"));
         when(domainService.resolveService(anyString(), eq("corte"))).thenReturn(Optional.of(corte));
-        when(domainService.canScheduleViaWhatsApp(anyString())).thenReturn(true);
-        when(domainService.resolveRegisteredCustomerName(anyString(), anyString())).thenReturn(Optional.empty());
+        // stage vira ASK_NAME (cliente sem nome) antes do branch que consulta canScheduleViaWhatsApp,
+        // então o stub pode não ser exercido neste caminho.
+        lenient().when(domainService.canScheduleViaWhatsApp(anyString())).thenReturn(true);
+        lenient().when(domainService.resolveRegisteredCustomerName(anyString(), anyString())).thenReturn(Optional.empty());
 
         AssistantMessageResponse response = service.process(
                 "quero agendar para hoje um corte de cabelo",
@@ -172,8 +190,21 @@ class AssistantConversationReactivationUnitTest {
     }
 
     private void setPrivateField(String fieldName, Object value) throws Exception {
-        Field field = AssistantConversationService.class.getDeclaredField(fieldName);
-        field.setAccessible(true);
-        field.set(service, value);
+        boolean set = false;
+        for (Object target : new Object[] {service, agentHandler, legacyHandler}) {
+            Class<?> c = target.getClass();
+            while (c != null) {
+                try {
+                    Field field = c.getDeclaredField(fieldName);
+                    field.setAccessible(true);
+                    field.set(target, value);
+                    set = true;
+                    break;
+                } catch (NoSuchFieldException e) {
+                    c = c.getSuperclass();
+                }
+            }
+        }
+        if (!set) throw new NoSuchFieldException(fieldName);
     }
 }

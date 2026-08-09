@@ -1,0 +1,484 @@
+package br.com.phdigitalcode.azzo.assistant.application.service;
+
+import br.com.phdigitalcode.azzo.assistant.classifier.OpenNLPIntentClassifier;
+import br.com.phdigitalcode.azzo.assistant.dialogue.ChatMessage;
+import br.com.phdigitalcode.azzo.assistant.dialogue.ConversationData;
+import br.com.phdigitalcode.azzo.assistant.dialogue.ConversationStage;
+import br.com.phdigitalcode.azzo.assistant.dialogue.TimePeriod;
+import br.com.phdigitalcode.azzo.assistant.domain.entity.ConversationStateEntity;
+import br.com.phdigitalcode.azzo.assistant.domain.repository.ConversationStateRepository;
+import br.com.phdigitalcode.azzo.assistant.extractor.ProfessionalNameFinder;
+import br.com.phdigitalcode.azzo.assistant.extractor.ServiceNameFinder;
+import br.com.phdigitalcode.azzo.assistant.infrastructure.tenant.ContextoTenant;
+import br.com.phdigitalcode.azzo.assistant.llm.AgentSystemPromptBuilder;
+import br.com.phdigitalcode.azzo.assistant.llm.LlmBookingAgent;
+import br.com.phdigitalcode.azzo.assistant.llm.OllamaIntentService;
+import br.com.phdigitalcode.azzo.assistant.model.AssistantMessageResponse;
+import br.com.phdigitalcode.azzo.assistant.model.IntentPrediction;
+import br.com.phdigitalcode.azzo.assistant.model.IntentType;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.Spy;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import java.lang.reflect.Field;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+/**
+ * Cobre o fluxo orientado a LLM (assistant.agent.enabled=true), especificamente
+ * os bugs corrigidos: reconhecimento de horário coloquial ("17h"), prioridade
+ * horário > período, não repetir pergunta sobre dado já conhecido e rejeição de
+ * respostas contraditórias antes de chegarem ao cliente/histórico.
+ */
+@ExtendWith(MockitoExtension.class)
+@DisplayName("AssistantConversationService — fluxo agente (LLM pool)")
+class AssistantConversationServiceAgentFlowUnitTest {
+
+    @Mock OpenNLPIntentClassifier intentClassifier;
+    @Mock ServiceNameFinder serviceNameFinder;
+    @Mock ProfessionalNameFinder professionalNameFinder;
+    @Mock AssistantDomainService domainService;
+    @Mock ConversationStateRepository stateRepository;
+    @Mock ConversationStateManager stateManager;
+    @Mock ContextoTenant contextoTenant;
+    @Mock AgentSystemPromptBuilder agentSystemPromptBuilder;
+    @Mock LlmBookingAgent llmBookingAgent;
+    @Mock OllamaIntentService ollamaIntentService;
+    @Mock ConversationLockManager lockManager;
+
+    @Spy
+    ObjectMapper objectMapper = buildObjectMapper();
+
+    @InjectMocks
+    AgentMessageHandler agentHandler;
+    @InjectMocks
+    LegacyMessageHandler legacyHandler;
+
+    @InjectMocks
+    AssistantConversationService service;
+
+    private static final String USER_ID = "+5511999990001";
+    private static final String USER_NAME = "Phelipp";
+    private UUID tenantId;
+    private UUID professionalId;
+    private UUID serviceId;
+
+    private static ObjectMapper buildObjectMapper() {
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.registerModule(new JavaTimeModule());
+        mapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+        return mapper;
+    }
+
+    @BeforeEach
+    void setUp() throws Exception {
+        tenantId = UUID.randomUUID();
+        professionalId = UUID.randomUUID();
+        serviceId = UUID.randomUUID();
+        service.agentHandler = agentHandler;
+        service.legacyHandler = legacyHandler;
+        setPrivateField("ttlMinutes", 120L);
+        setPrivateField("greetingZone", "America/Sao_Paulo");
+        setPrivateField("minIntentConfidence", 0.62d);
+        setPrivateField("agentEnabled", true);
+        setPrivateField("llmMaxInputChars", 1000);
+        setPrivateField("maxHistoryMessages", 80);
+        setPrivateField("keepHistoryMessages", 60);
+        setPrivateField("maxHistoryChars", 3000);
+        lenient().when(stateManager.toJson(any(ConversationData.class))).thenReturn("{}");
+        lenient().doNothing().when(stateManager).save(any(ConversationStateEntity.class), anyString());
+        lenient().doNothing().when(stateManager).delete(any(ConversationStateEntity.class));
+        lenient().when(contextoTenant.obterTenantIdOuFalhar()).thenReturn(tenantId);
+        lenient().when(stateRepository.deleteExpired(any())).thenReturn(0L);
+        lenient().when(agentSystemPromptBuilder.build(anyString())).thenReturn("SYSTEM_PROMPT_STUB");
+        // ConversationLockManager só serializa por chave tenant+telefone; em teste unitário
+        // basta executar a ação recebida diretamente, sem lock real (ver Fix 1).
+        lenient().when(lockManager.withLock(anyString(), any())).thenAnswer(invocation -> {
+            java.util.function.Supplier<?> action = invocation.getArgument(1);
+            return action.get();
+        });
+    }
+
+    private void setPrivateField(String fieldName, Object value) throws Exception {
+        boolean set = false;
+        for (Object target : new Object[] {service, agentHandler, legacyHandler}) {
+            Class<?> c = target.getClass();
+            while (c != null) {
+                try {
+                    Field field = c.getDeclaredField(fieldName);
+                    field.setAccessible(true);
+                    field.set(target, value);
+                    set = true;
+                    break;
+                } catch (NoSuchFieldException e) {
+                    c = c.getSuperclass();
+                }
+            }
+        }
+        if (!set) throw new NoSuchFieldException(fieldName);
+    }
+
+    private ConversationStateEntity entityComEstado(ConversationData data) throws Exception {
+        ConversationStateEntity entity = new ConversationStateEntity();
+        entity.tenantId = tenantId;
+        entity.userIdentifier = USER_ID;
+        entity.stateJson = objectMapper.writeValueAsString(data);
+        entity.updatedAt = Instant.now();
+        return entity;
+    }
+
+    private void setupUsuarioComEstado(ConversationData data) throws Exception {
+        // entityComEstado() interage com o @Spy objectMapper (writeValueAsString). Computa a
+        // entidade ANTES de abrir o when(...) para não disparar UnfinishedStubbing do Mockito.
+        // O carregamento de estado em produção passa por stateManager.loadOrCreate (após o
+        // refactor de limpeza de conversas via scheduler) — é esse o ponto a stubar, não o
+        // stateRepository.findActive direto.
+        ConversationStateEntity entity = entityComEstado(data);
+        when(stateManager.loadOrCreate(eq(tenantId), anyString(), any()))
+                .thenReturn(entity);
+        // processLocked desserializa o estado via stateManager.parseState(); devolve o
+        // próprio objeto de estado do teste (mais fiel que depender do round-trip JSON).
+        when(stateManager.parseState(anyString()))
+                .thenReturn(data);
+    }
+
+    // ─── Sintoma 1: saudação não deve inventar "Confirma?" ───────────────────────
+
+    @Test
+    @DisplayName("'Oi' em conversa nova responde deterministicamente pedindo o próximo dado, sem chamar o LLM")
+    void oi_semDadosOperacionais_naoChamaLlmEPedeProximoCampo() throws Exception {
+        ConversationData estadoNovo = new ConversationData();
+        estadoNovo.customerName = USER_NAME;
+        estadoNovo.stage = ConversationStage.START;
+        setupUsuarioComEstado(estadoNovo);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.GREETING, 0.97d));
+        when(domainService.formatServicesPrompt(any())).thenReturn("Qual serviço você deseja?");
+
+        AssistantMessageResponse response = service.process("Oi", USER_ID, USER_NAME);
+
+        assertEquals("Qual serviço você deseja?", response.reply);
+        assertEquals(ConversationStage.ASK_SERVICE, response.stage);
+        verify(llmBookingAgent, never()).chat(anyString(), anyList(), anyString(), any(), any());
+    }
+
+    // ─── Sintoma 2: horário coloquial + prioridade sobre período ────────────────
+
+    @Test
+    @DisplayName("'Às 17h' com profissional/data já conhecidos: reconhece horário, deriva período e nunca perde o profissional/data")
+    void horarioColoquial_reconheceEDerivaPerioco_semReperguntar() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte Masculino";
+        estado.professionalId = professionalId;
+        estado.professionalName = "Riane";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.stage = ConversationStage.ASK_TIME;
+        setupUsuarioComEstado(estado);
+
+        // Não estuba intentClassifier: com horário já reconhecido no texto, o
+        // atalho determinístico curto-circuita antes de classificar intenção.
+
+        // Simula o bug real de produção: o LLM emite o alias "riane" (nome, não o
+        // alias interno tipo "P1"), que portanto NÃO resolve — resolveProfessionalId
+        // retorna Optional.empty() por padrão do Mockito.
+        ArgumentCaptor<String> messageCaptor = ArgumentCaptor.forClass(String.class);
+        when(llmBookingAgent.chat(anyString(), anyList(), messageCaptor.capture(), any(), any()))
+                .thenReturn(new LlmBookingAgent.AgentResult(
+                        "Vou verificar se 17h está disponível com a Riane 😊",
+                        List.of(new LlmBookingAgent.AgentAction("CONSULTAR_HORARIOS",
+                                java.util.Map.of("prof", "riane", "date", estado.date.toString()))),
+                        "POOL"));
+        when(domainService.suggestTimes(eq(tenantId.toString()), eq(professionalId), eq(estado.date), eq(serviceId), any()))
+                .thenReturn(List.of("17:00", "17:30"));
+
+        AssistantMessageResponse response = service.process("Às 17h", USER_ID, USER_NAME);
+
+        // Horário reconhecido e período derivado dele (17h -> tarde)
+        assertEquals("17:00", response.slots.get("time"));
+        assertEquals(TimePeriod.AFTERNOON.label(), response.slots.get("preferredPeriod"));
+
+        // O prompt enviado ao LLM não pode mais pedir período/horário — o horário já é conhecido
+        String sentMessage = messageCaptor.getValue();
+        assertFalse(sentMessage.toLowerCase().contains("falta agora: periodo"),
+                "Não deveria pedir período com horário já resolvido. Mensagem: " + sentMessage);
+        assertTrue(sentMessage.toLowerCase().contains("consultar disponibilidade"),
+                "Deveria sinalizar consulta de disponibilidade. Mensagem: " + sentMessage);
+
+        // executeConsultarHorarios não pode ter perdido profissional/data já conhecidos
+        assertFalse(response.reply.toLowerCase().contains("nao consegui identificar")
+                        && response.reply.toLowerCase().contains("profissional"),
+                "Não deveria contradizer dados já conhecidos. Reply: " + response.reply);
+    }
+
+    // ─── Sintoma 3: resposta contraditória nunca chega ao cliente/histórico ─────
+
+    @Test
+    @DisplayName("Resposta da LLM que contradiz profissional/data já conhecidos é descartada e substituída")
+    void respostaContraditoria_eDescartadaESubstituida() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte Masculino";
+        estado.professionalId = professionalId;
+        estado.professionalName = "Riane";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.time = "17:00";
+        estado.preferredPeriod = TimePeriod.AFTERNOON;
+        estado.stage = ConversationStage.ASK_TIME;
+        setupUsuarioComEstado(estado);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+        when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
+                .thenReturn(new LlmBookingAgent.AgentResult(
+                        "Não consegui identificar o profissional ou a data. Tente novamente.",
+                        List.of(),
+                        "POOL"));
+
+        AssistantMessageResponse response = service.process("confirma pra mim", USER_ID, USER_NAME);
+
+        assertFalse(response.reply.toLowerCase().contains("nao consegui identificar"),
+                "Resposta contraditória não deveria chegar ao cliente. Reply: " + response.reply);
+    }
+
+    // ─── Fix 2: conflito de horário (race condition) ao criar o agendamento ─────
+
+    @Test
+    @DisplayName("Confirmação 'sim' com horário que virou indisponível entre a checagem e a criação (IllegalStateException do domainService) reoferece horários em vez de propagar o erro ao cliente")
+    void confirmacaoComConflitoDeHorario_reofereceHorariosEmVezDePropagarErro() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte Masculino";
+        estado.professionalId = professionalId;
+        estado.professionalName = "Riane";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.time = "17:00";
+        estado.preferredPeriod = TimePeriod.AFTERNOON;
+        estado.stage = ConversationStage.CONFIRMATION;
+        setupUsuarioComEstado(estado);
+
+        // resolveIntentWithLlmPriority classifica a mensagem antes do handler determinístico
+        // de confirmação; sem este stub o classificador (mock) retorna null e dá NPE. O "sim"
+        // é interceptado por handleAgentBookingConfirmationFlow antes de qualquer chamada ao LLM.
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+
+        // isSlotAvailable() ainda vê o horário como livre (checagem "otimista"), mas
+        // outro cliente reserva entre essa checagem e o INSERT — o service de domínio
+        // relança isso como IllegalStateException.
+        when(domainService.isSlotAvailable(eq(tenantId.toString()), eq(professionalId), eq(estado.date), eq("17:00"), eq(serviceId)))
+                .thenReturn(true);
+        when(domainService.createPendingAppointment(eq(tenantId.toString()), eq(serviceId), eq(professionalId),
+                eq(estado.date), eq("17:00"), eq(USER_ID), eq(USER_NAME)))
+                .thenThrow(new IllegalStateException("Horario indisponivel para criacao do agendamento"));
+        when(domainService.suggestTimes(eq(tenantId.toString()), eq(professionalId), eq(estado.date), eq(serviceId), any()))
+                .thenReturn(List.of("18:00", "18:30"));
+
+        AssistantMessageResponse response = service.process("sim", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        assertEquals(ConversationStage.ASK_TIME, response.stage,
+                "Deve voltar a pedir horário em vez de deixar a exceção do banco propagar. Reply: " + response.reply);
+        assertTrue(response.reply.contains("18:00") && response.reply.contains("18:30"),
+                "Deve reoferecer os novos horários disponíveis em vez de uma mensagem de erro genérica. Reply: " + response.reply);
+        // O conflito é tratado deterministicamente — não deveria custar uma chamada ao LLM.
+        verify(llmBookingAgent, never()).chat(anyString(), anyList(), anyString(), any(), any());
+    }
+
+    // ─── Item 12: paráfrase contraditória (não coberta pelas frases fixas) ───────
+
+    @Test
+    @DisplayName("Item 12: paráfrase da LLM re-perguntando um slot já preenchido (que escapa das frases fixas) é descartada pela detecção estrutural")
+    void parafraseContraditoria_eDescartadaPelaDeteccaoEstrutural() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte Masculino";
+        estado.professionalId = professionalId;
+        estado.professionalName = "Riane";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.time = "17:00";
+        estado.preferredPeriod = TimePeriod.AFTERNOON;
+        estado.stage = ConversationStage.ASK_TIME;
+        setupUsuarioComEstado(estado);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+        // Paráfrase deliberada: NÃO contém nenhuma das frases fixas checadas
+        // ("qual servico voce deseja/quer"), então só a camada estrutural do item 12
+        // (REASK_SERVICE: "qual ... servico") consegue barrá-la. Serviço já está
+        // preenchido no estado → é uma contradição.
+        String parafrase = "Poderia me dizer novamente qual é o serviço desejado?";
+        when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
+                .thenReturn(new LlmBookingAgent.AgentResult(parafrase, List.of(), "POOL"));
+
+        AssistantMessageResponse response = service.process("pode ser", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        assertFalse(response.reply.toLowerCase().contains("servico desejado")
+                        || response.reply.toLowerCase().contains("serviço desejado"),
+                "A paráfrase que re-pergunta um serviço já conhecido não deveria chegar ao cliente. Reply: " + response.reply);
+        assertFalse(response.reply.isBlank(), "Deve haver uma resposta determinística substituta. Reply: " + response.reply);
+    }
+
+    // ─── Anti-loop de confirmação (confirma? em texto livre do LLM) ──────────────
+
+    @Test
+    @DisplayName("Anti-loop: LLM perguntou 'confirma?' como texto livre (stage != CONFIRMATION) e cliente afirma com todos os slots resolvidos → cria deterministicamente, sem depender do token do LLM")
+    void confirmacaoPendenteForaDoEstagio_comSlotsCompletos_criaDeterministicamente() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte";
+        estado.professionalId = professionalId;
+        estado.professionalName = "Phelipp";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.time = "17:00";
+        estado.preferredPeriod = TimePeriod.AFTERNOON;
+        // stage NUNCA foi promovido para CONFIRMATION — o "confirma?" veio do texto livre do LLM.
+        estado.stage = ConversationStage.ASK_TIME;
+        estado.chatHistory.add(new ChatMessage("assistant", "O serviço está disponível às 17:00. Confirma?"));
+        setupUsuarioComEstado(estado);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+
+        UUID appointmentId = UUID.randomUUID();
+        when(domainService.isSlotAvailable(eq(tenantId.toString()), eq(professionalId), eq(estado.date), eq("17:00"), eq(serviceId)))
+                .thenReturn(true);
+        when(domainService.createPendingAppointment(eq(tenantId.toString()), eq(serviceId), eq(professionalId),
+                eq(estado.date), eq("17:00"), eq(USER_ID), eq(USER_NAME)))
+                .thenReturn(appointmentId);
+
+        AssistantMessageResponse response = service.process("sim", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        // O backend cria o agendamento por conta própria, sem esperar o token do LLM.
+        verify(domainService).createPendingAppointment(eq(tenantId.toString()), eq(serviceId), eq(professionalId),
+                eq(estado.date), eq("17:00"), eq(USER_ID), eq(USER_NAME));
+        verify(domainService).confirmAppointment(eq(tenantId.toString()), eq(appointmentId), eq(USER_ID));
+        // Determinístico — não gasta chamada ao LLM (era exatamente o loop que travava).
+        verify(llmBookingAgent, never()).chat(anyString(), anyList(), anyString(), any(), any());
+    }
+
+    @Test
+    @DisplayName("Anti-loop: LLM perguntou 'confirma?' mas falta o profissional (não resolveu) → pergunta o dado que falta deterministicamente, sem reoferecer confirmação nem chamar o LLM")
+    void confirmacaoPendente_comSlotCentralFaltando_perguntaOQueFaltaSemLoop() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte";
+        // professionalId NÃO resolveu — é o gatilho suspeito do caso real ("phelipp").
+        estado.professionalId = null;
+        estado.date = LocalDate.now().plusDays(1);
+        estado.stage = ConversationStage.ASK_TIME;
+        estado.chatHistory.add(new ChatMessage("assistant", "Tudo pronto, posso confirmar o agendamento. Confirma?"));
+        setupUsuarioComEstado(estado);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+        // buildProfessionalPrompt consulta os profissionais do serviço.
+        when(domainService.listProfessionalsByService(eq(tenantId.toString()), eq(serviceId)))
+                .thenReturn(List.of());
+
+        AssistantMessageResponse response = service.process("sim", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        assertEquals(ConversationStage.ASK_PROFESSIONAL, response.stage,
+                "Sem profissional resolvido, deve voltar a pedir o profissional em vez de reoferecer confirmação. Reply: " + response.reply);
+        assertFalse(response.reply.toLowerCase().contains("confirma"),
+                "Não pode continuar reoferecendo 'confirma?' quando não há o que confirmar. Reply: " + response.reply);
+        verify(domainService, never()).createPendingAppointment(anyString(), any(), any(), any(), anyString(), anyString(), any());
+        verify(llmBookingAgent, never()).chat(anyString(), anyList(), anyString(), any(), any());
+    }
+
+    // ─── #5: vazamento de system prompt / narração interna ──────────────────────
+
+    @Test
+    @DisplayName("#5: resposta que vaza narração interna ('Cliente pediu...') é descartada, não chega ao cliente")
+    void vazamentoDeNarracaoInterna_eDescartado() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Corte";
+        estado.professionalId = professionalId;
+        estado.professionalName = "Phelipp";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.time = "15:00";
+        estado.preferredPeriod = TimePeriod.AFTERNOON;
+        estado.stage = ConversationStage.ASK_TIME;
+        setupUsuarioComEstado(estado);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+        // Eco literal do system prompt (ver AgentSystemPromptBuilder: "CLIENTE PEDIU HORARIO...").
+        String vazamento = "Cliente pediu o horário na segunda-feira, mas não veio nenhum serviço listado. "
+                + "Vou verificar disponibilidade para 15:00.";
+        when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
+                .thenReturn(new LlmBookingAgent.AgentResult(vazamento, List.of(), "POOL"));
+
+        AssistantMessageResponse response = service.process("esta bem", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        String reply = response.reply.toLowerCase();
+        assertFalse(reply.contains("cliente pediu"),
+                "narração em 3a pessoa não pode chegar ao cliente. Reply: " + response.reply);
+        assertFalse(reply.contains("nenhum serviço listado") || reply.contains("nenhum servico listado"),
+                "eco de instrução do system prompt não pode vazar. Reply: " + response.reply);
+    }
+
+    // ─── Confirmação ancorada ao serviço realmente resolvido (corte vs Teste) ───
+
+    @Test
+    @DisplayName("Confirmação do LLM que cita serviço diferente do resolvido é ancorada ao slot real (não confirma 'corte' quando o backend resolveu 'Teste')")
+    void confirmacaoDoLlm_ancoradaAoServicoResolvido() throws Exception {
+        ConversationData estado = new ConversationData();
+        estado.customerName = USER_NAME;
+        estado.serviceId = serviceId;
+        estado.serviceName = "Teste";              // serviço REALMENTE resolvido no backend
+        estado.professionalId = professionalId;
+        estado.professionalName = "Phelipp Damasceno";
+        estado.date = LocalDate.now().plusDays(1);
+        estado.time = "15:00";
+        estado.preferredPeriod = TimePeriod.AFTERNOON;
+        estado.stage = ConversationStage.ASK_TIME; // LLM não promoveu para CONFIRMATION
+        setupUsuarioComEstado(estado);
+
+        when(intentClassifier.classifyWithConfidence(anyString()))
+                .thenReturn(new IntentPrediction(IntentType.UNKNOWN, 0.1d));
+        // LLM confirma "corte" (eco do pedido do cliente), divergente do slot resolvido "Teste".
+        String confirmacaoLlm = "Confirmando agendamento para corte na segunda-feira às 15h com Phelipp Damasceno. Vamos confirmar?";
+        when(llmBookingAgent.chat(anyString(), anyList(), anyString(), any(), any()))
+                .thenReturn(new LlmBookingAgent.AgentResult(confirmacaoLlm, List.of(), "POOL"));
+
+        AssistantMessageResponse response = service.process("pode ser", USER_ID, USER_NAME);
+
+        assertNotNull(response);
+        assertEquals(ConversationStage.CONFIRMATION, response.stage,
+                "deve promover para o estágio CONFIRMATION determinístico. Reply: " + response.reply);
+        assertTrue(response.reply.contains("Teste"),
+                "a confirmação deve refletir o serviço realmente resolvido. Reply: " + response.reply);
+        assertFalse(response.reply.toLowerCase().contains("corte"),
+                "não pode confirmar um serviço diferente do resolvido. Reply: " + response.reply);
+    }
+}

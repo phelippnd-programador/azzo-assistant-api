@@ -1,23 +1,23 @@
 package br.com.phdigitalcode.azzo.assistant.llm;
 
 import java.time.LocalDate;
-import java.util.List;
 import java.util.Optional;
 
-import org.eclipse.microprofile.config.inject.ConfigProperty;
-import org.eclipse.microprofile.rest.client.inject.RestClient;
 import org.jboss.logging.Logger;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
+import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmRequest;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.dto.LlmResponse;
+import br.com.phdigitalcode.azzo.assistant.llm.pool.execution.LlmPoolExecutor;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 /**
- * Extrai datas em linguagem natural usando Ollama.
- * Usado como fallback quando o DateTimeRegexExtractor retorna empty().
- * Sempre retorna Optional.empty() em caso de erro — nunca lança exceção.
+ * Extrai datas em linguagem natural via LLM (pool de provedores). Usado como
+ * fallback quando o DateTimeRegexExtractor retorna empty(). Sempre retorna
+ * Optional.empty() em caso de erro/indisponibilidade — nunca lança exceção.
  */
 @ApplicationScoped
 public class OllamaDateEnricher {
@@ -25,29 +25,17 @@ public class OllamaDateEnricher {
     private static final Logger LOG = Logger.getLogger(OllamaDateEnricher.class);
 
     @Inject
-    @RestClient
-    OllamaRestClient ollamaRestClient;
+    LlmPoolExecutor poolExecutor;
 
     @Inject
     ObjectMapper objectMapper;
 
-    @ConfigProperty(name = "assistant.ollama.enabled", defaultValue = "false")
-    boolean enabled;
-
-    @ConfigProperty(name = "assistant.ollama.model", defaultValue = "gemma2:2b")
-    String model;
-
     /**
      * Tenta extrair uma data da mensagem usando LLM.
-     * Retorna Optional.empty() se não encontrar ou se Ollama falhar.
+     * Retorna Optional.empty() se não encontrar ou se o pool falhar.
      */
     public Optional<LocalDate> enrich(String rawMessage) {
-        if (!enabled) {
-            LOG.debugf("Ollama desabilitado, pulando enriquecimento de data");
-            return Optional.empty();
-        }
-
-        LOG.infof("[Ollama] Extraindo data de: '%s' (model=%s)", rawMessage, model);
+        LOG.infof("[LlmDate] Extraindo data de: '%s'", rawMessage);
         long start = System.currentTimeMillis();
         try {
             LocalDate today = LocalDate.now();
@@ -67,22 +55,19 @@ public class OllamaDateEnricher {
                 - Se não houver data, responda {"date": null}
                 """.formatted(today, today, today.plusDays(1));
 
-            OllamaChatRequest request = new OllamaChatRequest();
-            request.model = model;
-            request.stream = false;
-            request.format = "json";
-            request.options = new OllamaOptions(0.0, 30);
-            request.messages = List.of(
-                new OllamaMessage("system", systemPrompt),
-                new OllamaMessage("user", rawMessage)
-            );
+            LlmRequest req = new LlmRequest();
+            req.systemPrompt = systemPrompt;
+            req.mensagemAtual = rawMessage;
+            req.temperatura = 0.0;
+            req.maxTokens = 30;
+            req.jsonMode = true;
 
-            OllamaChatResponse response = ollamaRestClient.chat(request);
-            if (response == null || response.message == null || response.message.content == null) {
+            LlmResponse response = poolExecutor.executar(req);
+            if (response == null || response.erro() || response.vazia()) {
                 return Optional.empty();
             }
 
-            JsonNode node = objectMapper.readTree(response.message.content);
+            JsonNode node = objectMapper.readTree(response.texto());
             JsonNode dateNode = node.path("date");
             if (dateNode.isNull() || dateNode.isMissingNode()) {
                 return Optional.empty();
@@ -95,12 +80,12 @@ public class OllamaDateEnricher {
 
             LocalDate parsed = LocalDate.parse(dateStr);
             long elapsed = System.currentTimeMillis() - start;
-            LOG.infof("[Ollama] Data extraída: %s em %dms para: '%s'", parsed, elapsed, rawMessage);
+            LOG.infof("[LlmDate] Data extraída: %s em %dms para: '%s'", parsed, elapsed, rawMessage);
             return Optional.of(parsed);
 
         } catch (Exception e) {
             long elapsed = System.currentTimeMillis() - start;
-            LOG.warnf("[Ollama] Date enrich falhou após %dms → fallback regex. Causa: %s", elapsed, e.getMessage());
+            LOG.warnf("[LlmDate] Date enrich falhou após %dms → fallback regex. Causa: %s", elapsed, e.getMessage());
             return Optional.empty();
         }
     }

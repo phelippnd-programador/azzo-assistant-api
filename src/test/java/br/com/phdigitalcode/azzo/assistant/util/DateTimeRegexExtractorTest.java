@@ -5,7 +5,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.DayOfWeek;
 import java.time.LocalDate;
+import java.time.temporal.TemporalAdjusters;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -94,6 +96,53 @@ class DateTimeRegexExtractorTest {
         assertTrue(result.isEmpty());
     }
 
+    // ─── extractDate: dia da semana (bug do fluxo WhatsApp) ─────────────────────
+
+    @Test
+    @DisplayName("'segunda' resolve para a próxima segunda futura (nunca hoje)")
+    void extractDate_diaDaSemana_segunda() {
+        Optional<LocalDate> result = DateTimeRegexExtractor.extractDate("quero na segunda");
+        assertTrue(result.isPresent());
+        LocalDate esperado = LocalDate.now().plusDays(1)
+                .with(TemporalAdjusters.nextOrSame(DayOfWeek.MONDAY));
+        assertEquals(esperado, result.get());
+        assertEquals(DayOfWeek.MONDAY, result.get().getDayOfWeek());
+        assertTrue(result.get().isAfter(LocalDate.now()), "dia da semana deve sempre cair no futuro");
+    }
+
+    @Test
+    @DisplayName("'segunda-feira' com sufixo e horário junto também resolve o dia")
+    void extractDate_diaDaSemana_comSufixo() {
+        Optional<LocalDate> result = DateTimeRegexExtractor.extractDate("pode ser segunda-feira as 15h");
+        assertTrue(result.isPresent());
+        assertEquals(DayOfWeek.MONDAY, result.get().getDayOfWeek());
+        assertTrue(result.get().isAfter(LocalDate.now()));
+    }
+
+    @Test
+    @DisplayName("'terça' (com acento) resolve para a próxima terça futura")
+    void extractDate_diaDaSemana_terca() {
+        Optional<LocalDate> result = DateTimeRegexExtractor.extractDate("marca pra terça");
+        assertTrue(result.isPresent());
+        assertEquals(DayOfWeek.TUESDAY, result.get().getDayOfWeek());
+        assertTrue(result.get().isAfter(LocalDate.now()));
+    }
+
+    @Test
+    @DisplayName("'segunda opção' (ordinal) NÃO é interpretado como dia da semana")
+    void extractDate_segundaOrdinal_naoEData() {
+        Optional<LocalDate> result = DateTimeRegexExtractor.extractDate("quero a segunda opção");
+        assertTrue(result.isEmpty(), "ordinal não deve virar data. Resultado: " + result);
+    }
+
+    @Test
+    @DisplayName("'depois de amanhã' retorna hoje+2 (não é capturado como 'amanhã')")
+    void extractDate_depoisDeAmanha() {
+        Optional<LocalDate> result = DateTimeRegexExtractor.extractDate("depois de amanhã");
+        assertTrue(result.isPresent());
+        assertEquals(LocalDate.now().plusDays(2), result.get());
+    }
+
     // ─── extractTime ──────────────────────────────────────────────────────────
 
     @Test
@@ -140,6 +189,48 @@ class DateTimeRegexExtractorTest {
     @DisplayName("texto sem horário retorna Optional.empty()")
     void extractTime_semHorario_retornaEmpty() {
         Optional<String> result = DateTimeRegexExtractor.extractTime("quero agendar");
+        assertTrue(result.isEmpty());
+    }
+
+    // ─── extractTimeLoose ─────────────────────────────────────────────────────
+
+    @ParameterizedTest(name = "'{0}' extrai 17:00")
+    @ValueSource(strings = {"17h", "17:00", "às 17", "as 17", "17 horas", "17hs"})
+    @DisplayName("formas explícitas/coloquiais de '17h' resolvem para 17:00")
+    void extractTimeLoose_dezessete(String input) {
+        Optional<String> result = DateTimeRegexExtractor.extractTimeLoose(input);
+        assertTrue(result.isPresent(), "esperava horário para '" + input + "'");
+        assertEquals("17:00", result.get());
+    }
+
+    @ParameterizedTest(name = "'{0}' extrai 17:00 (extenso)")
+    @ValueSource(strings = {"cinco da tarde", "5 da tarde", "às cinco da tarde", "cinco horas da tarde"})
+    @DisplayName("números por extenso com período resolvem para 17:00")
+    void extractTimeLoose_extenso(String input) {
+        Optional<String> result = DateTimeRegexExtractor.extractTimeLoose(input);
+        assertTrue(result.isPresent(), "esperava horário para '" + input + "'");
+        assertEquals("17:00", result.get());
+    }
+
+    @Test
+    @DisplayName("'amanhã à tarde às 17h' prioriza o horário específico (17:00)")
+    void extractTimeLoose_horarioTemPrioridadeSobrePeriodo() {
+        Optional<String> result = DateTimeRegexExtractor.extractTimeLoose("amanhã à tarde às 17h");
+        assertTrue(result.isPresent());
+        assertEquals("17:00", result.get());
+    }
+
+    @Test
+    @DisplayName("número solto sem âncora de horário/período não é reconhecido como horário")
+    void extractTimeLoose_numeroSoltoSemAncora_retornaEmpty() {
+        Optional<String> result = DateTimeRegexExtractor.extractTimeLoose("quero marcar duas pessoas");
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    @DisplayName("texto sem horário retorna Optional.empty()")
+    void extractTimeLoose_semHorario_retornaEmpty() {
+        Optional<String> result = DateTimeRegexExtractor.extractTimeLoose("quero agendar");
         assertTrue(result.isEmpty());
     }
 

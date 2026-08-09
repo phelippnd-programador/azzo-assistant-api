@@ -75,6 +75,29 @@ class TimePeriodTest {
         assertEquals("noite", TimePeriod.NIGHT.label());
     }
 
+    // ─── fromHour ─────────────────────────────────────────────────────────────
+
+    @ParameterizedTest(name = "hora {0} deve mapear para MORNING")
+    @ValueSource(ints = {0, 6, 8, 11})
+    @DisplayName("horas antes das 12h mapeiam para MORNING")
+    void fromHour_manha(int hour) {
+        assertEquals(TimePeriod.MORNING, TimePeriod.fromHour(hour));
+    }
+
+    @ParameterizedTest(name = "hora {0} deve mapear para AFTERNOON")
+    @ValueSource(ints = {12, 14, 17})
+    @DisplayName("horas entre 12h e 17h59 mapeiam para AFTERNOON")
+    void fromHour_tarde(int hour) {
+        assertEquals(TimePeriod.AFTERNOON, TimePeriod.fromHour(hour));
+    }
+
+    @ParameterizedTest(name = "hora {0} deve mapear para NIGHT")
+    @ValueSource(ints = {18, 20, 23})
+    @DisplayName("horas a partir das 18h mapeiam para NIGHT")
+    void fromHour_noite(int hour) {
+        assertEquals(TimePeriod.NIGHT, TimePeriod.fromHour(hour));
+    }
+
     // ─── enum values ──────────────────────────────────────────────────────────
 
     @Test

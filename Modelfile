@@ -1,0 +1,59 @@
+FROM llama3.2:3b
+
+# ─────────────────────────────────────────────────────────────────────────
+# azzo-assistant-llama32 — base para o modo agente (ASSISTANT_AGENT_ENABLED=true)
+#
+# IMPORTANTE: o app (AssistantConversationService/LlmRouter/AgentSystemPromptBuilder
+# e os extratores em br.com.phdigitalcode.azzo.assistant.llm.*) SEMPRE envia sua
+# própria mensagem "system" e SEMPRE sobrescreve temperature/num_predict por
+# chamada via OllamaOptions. O SYSTEM e os PARAMETER temperature/num_predict
+# abaixo só valem para testes manuais via `ollama run azzo-assistant-llama32`
+# — nunca são usados pelo assistant-api em produção.
+#
+# O que REALMENTE importa e é respeitado pelo app: num_ctx, num_thread,
+# top_k, top_p, repeat_penalty (não são enviados por requisição).
+# ─────────────────────────────────────────────────────────────────────────
+
+# Prompt dinâmico (AgentSystemPromptBuilder) pode passar de 2000 tokens com
+# 15 serviços + 15 profissionais + horários + regras, mais até ~3000 chars
+# de histórico (assistant.conversation.max-history-chars). 8192 dá folga
+# confortável sem custo relevante de RAM/latência no seu hardware.
+PARAMETER num_ctx 8192
+
+# Seus 8 núcleos físicos — evita a heurística automática do Ollama subutilizar
+# ou competir com outros processos do host.
+PARAMETER num_thread 8
+
+# Preserva qualidade de geração em PT-BR informal sem ficar repetitivo nem
+# instável. Only estes três realmente atuam em produção (não são sobrescritos
+# por chamada).
+PARAMETER top_k 40
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.1
+
+# Não usados pelo app (sempre sobrescritos por OllamaOptions), mantidos só
+# como default sensato para `ollama run` manual.
+PARAMETER temperature 0.3
+PARAMETER num_predict 220
+
+SYSTEM """
+Você é Azza, atendente de um salão de beleza brasileiro no WhatsApp.
+Tom informal, acolhedor, direto — como uma atendente de verdade, nunca como robô.
+Responda sempre em português do Brasil.
+
+REGRA NÚMERO UM: você é um terminal de dados. Só fala sobre serviços, preços,
+profissionais e horários que estiverem explicitamente listados no contexto
+que a aplicação te fornecer. NUNCA invente preço, serviço, profissional,
+horário ou disponibilidade.
+
+Para agir sobre o sistema (agendar, consultar horários, cancelar), emita os
+tokens de ação exatamente no formato instruído pela aplicação — nunca diga
+que uma ação foi feita sem ter emitido o token correspondente.
+
+Máximo 4 linhas por resposta. No máximo 2 emojis.
+
+Nota: em produção, a aplicação injeta um system prompt completo (com a lista
+real de serviços, profissionais, horários e as regras de ação) a cada
+chamada — o texto acima só é usado se você rodar este modelo manualmente
+sem esse contexto.
+"""
